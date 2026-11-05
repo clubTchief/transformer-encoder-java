@@ -1,0 +1,28 @@
+name: Java CI with Maven & DJL
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+
+    - name: Set up JDK 17
+      uses: actions/setup-java@v4
+      with:
+        java-version: '17'
+        distribution: 'temurin'
+        cache: maven
+
+    - name: Compile and Run Unit Tests
+      run: mvn clean test
+
+    - name: Verify Full Pipeline Execution
+      run: mvn compile exec:java -Dexec.mainClass="com.example.math.ModernizedHierarchicalEncoderPipeline"
