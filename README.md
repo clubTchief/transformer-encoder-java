@@ -32,7 +32,3 @@ mvn clean compile
 
 # Run the Modernized 6-Layer Pipeline
 mvn exec:java -Dexec.mainClass="com.example.math.ModernizedHierarchicalEncoderPipeline"
-```
-
-## Documentation & Reference Manuals
-Full step-by-step mathematical guides and execution traces are documented in the project Google Docs technical reference manual (V8).
