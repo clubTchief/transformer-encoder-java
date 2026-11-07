@@ -5,6 +5,9 @@ import ai.djl.ndarray.NDArray;
 import ai.djl.ndarray.NDManager;
 import ai.djl.training.GradientCollector;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+
+import java.nio.file.Path;
 
 import java.util.Random;
 
@@ -79,6 +82,19 @@ class TinyGptTest {
         logits[CharTokenizer.UNK] = 100f;
         for (int i = 0; i < 50; i++) {
             assertThat(StoryGenerator.sample(logits, 1f, 0, 1f, new Random(i))).isNotEqualTo(CharTokenizer.UNK);
+        }
+    }
+
+    @Test
+    void checkpointRoundTripKeepsLogits(@TempDir Path dir) throws Exception {
+        try (NDManager m = NDManager.newBaseManager()) {
+            TinyGpt a = new TinyGpt(m, CFG, 1);
+            a.save(dir);
+            TinyGpt b = TinyGpt.load(m, dir);
+            NDArray ids = m.create(new int[][]{{1, 2, 3, 4}});
+            float[] la = a.forward(m, ids).toFloatArray();
+            float[] lb = b.forward(m, ids).toFloatArray();
+            for (int i = 0; i < la.length; i++) assertThat(lb[i]).isCloseTo(la[i], within(1e-6f));
         }
     }
 }
