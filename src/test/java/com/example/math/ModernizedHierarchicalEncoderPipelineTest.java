@@ -79,6 +79,34 @@ class ModernizedHierarchicalEncoderPipelineTest {
         assertNotNull(ropeTensor.toFloatArray());
     }
 
+    @Test
+    @DisplayName("Verify RoPE is fully differentiable and propagates gradients")
+    void testRoPEDifferentiability() {
+        int h = 2, N = 4, dK = 8;
+        
+        // Create input with autograd tracking enabled
+        NDArray splitTensor = manager.ones(new Shape(h, N, dK), DataType.FLOAT32);
+        splitTensor.setRequiresGradient(true);
+
+        GradientEngine gradEngine = new GradientEngine(0.01f);
+
+        try (GradientCollector collector = gradEngine.createCollector()) {
+            // Forward pass through vectorized RoPE
+            NDArray ropeOutput = ModernizedHierarchicalEncoderPipeline.applyRoPE(manager, splitTensor);
+            
+            // Scalar loss computation
+            NDArray loss = ropeOutput.sum();
+            
+            // Execute backpropagation
+            collector.backward(loss);
+        }
+
+        // Assert that gradients flowed backward into splitTensor
+        assertTrue(splitTensor.hasGradient(), "Input tensor to RoPE must receive gradients after backward pass");
+        assertNotNull(splitTensor.getGradient(), "Gradient tensor for RoPE input cannot be null");
+        assertEquals(new Shape(h, N, dK), splitTensor.getGradient().getShape());
+    }
+
     // =========================================================================
     // NEW AUTOGRAD, CAUSAL MASK & GRADIENT ENGINE TESTS
     // =========================================================================

@@ -217,32 +217,52 @@ public class ModernizedHierarchicalEncoderPipeline {
         return X.div(denominator);
     }
 
+    /**
+     * Applies Rotary Position Embeddings (RoPE) using fully differentiable NDArray operations.
+     * Preserves DJL autograd computation graph.
+     * 
+     * @param manager     DJL NDManager
+     * @param splitTensor Input head tensor of shape [numHeads, seqLen, dK]
+     * @return Rotated head tensor of shape [numHeads, seqLen, dK]
+     */
     public static NDArray applyRoPE(NDManager manager, NDArray splitTensor) {
         Shape shape = splitTensor.getShape();
-        int h = (int) shape.get(0);
-        int N = (int) shape.get(1);
-        int dK = (int) shape.get(2);
+        long numHeads = shape.get(0);
+        long seqLen = shape.get(1);
+        long dK = shape.get(2);
 
-        float[][][] data = to3DArray(splitTensor, h, N, dK);
-        float[] flatRotated = new float[h * N * dK];
-        int writeIdx = 0;
-
-        for (int head = 0; head < h; head++) {
-            for (int pos = 0; pos < N; pos++) {
-                for (int i = 0; i < dK / 2; i++) {
-                    double theta = pos / Math.pow(10000.0, (2.0 * i) / dK);
-                    float cos = (float) Math.cos(theta);
-                    float sin = (float) Math.sin(theta);
-
-                    float x1 = data[head][pos][2 * i];
-                    float x2 = data[head][pos][2 * i + 1];
-
-                    flatRotated[writeIdx++] = x1 * cos - x2 * sin;
-                    flatRotated[writeIdx++] = x1 * sin + x2 * cos;
-                }
-            }
+        // 1. Compute Theta frequencies: theta_i = 10000^(-2i / dK)
+        float[] invFreq = new float[(int) (dK / 2)];
+        for (int i = 0; i < dK / 2; i++) {
+            invFreq[i] = (float) (1.0 / Math.pow(10000.0, (2.0 * i) / dK));
         }
-        return manager.create(flatRotated, new Shape(h, N, dK));
+        NDArray invFreqND = manager.create(invFreq); // [dK / 2]
+
+        // 2. Generate position vector: pos = [0, 1, 2, ..., seqLen - 1]
+        NDArray posND = manager.arange(0, seqLen, 1, DataType.FLOAT32); // [seqLen]
+
+        // 3. Outer product pos (x) invFreq -> freqs matrix of shape [seqLen, dK / 2]
+        NDArray freqs = posND.reshape(new Shape(seqLen, 1)).matMul(invFreqND.reshape(new Shape(1, dK / 2)));
+
+        // 4. Duplicate frequencies for paired dimensions (cos/sin vectors of length dK)
+        // [seqLen, dK/2] -> [seqLen, dK]
+        NDArray cos = freqs.cos().repeat(1, 2).reshape(new Shape(1, seqLen, dK));
+        NDArray sin = freqs.sin().repeat(1, 2).reshape(new Shape(1, seqLen, dK));
+
+        // 5. Construct R(X) = [-x2, x1, -x4, x3, ...] via slicing and concatenation
+        // Slice even indices [0, 2, 4...] and odd indices [1, 3, 5...]
+        NDArray x1 = splitTensor.get("..., 0::2"); // Even features
+        NDArray x2 = splitTensor.get("..., 1::2"); // Odd features
+
+        // Negate odd features (-x2) and stack interleaved: [-x2, x1]
+        NDArray negX2 = x2.neg();
+        
+        // Stack along the last dimension and flatten to preserve feature layout
+        NDArray rx = negX2.stack(x1, -1).reshape(new Shape(numHeads, seqLen, dK));
+
+        // 6. Apply RoPE formula: (X * cos) + (R(X) * sin)
+        // Both operations are native DJL NDArray ops that retain autograd gradient tapes
+        return splitTensor.mul(cos).add(rx.mul(sin));
     }
 
     public static NDArray generatePositionalMatrix(NDManager manager, int seqLen, int dModel) {
