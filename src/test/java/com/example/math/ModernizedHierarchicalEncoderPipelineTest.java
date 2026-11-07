@@ -107,6 +107,57 @@ class ModernizedHierarchicalEncoderPipelineTest {
         assertEquals(new Shape(h, N, dK), splitTensor.getGradient().getShape());
     }
 
+    @Test
+    @DisplayName("RoPE gradient equals the analytic derivative of sum(rotation)")
+    void testRoPEGradientMatchesAnalyticValues() {
+        int h = 2, N = 4, dK = 8;
+        NDArray x = manager.ones(new Shape(h, N, dK), DataType.FLOAT32);
+        x.setRequiresGradient(true);
+
+        try (GradientCollector collector = new GradientEngine(0.01f).createCollector()) {
+            NDArray loss = ModernizedHierarchicalEncoderPipeline.applyRoPE(manager, x).sum();
+            collector.backward(loss);
+        }
+
+        // out[2i] = x1*c - x2*s, out[2i+1] = x1*s + x2*c  =>  d/dx1 = c + s, d/dx2 = c - s
+        float[] g = x.getGradient().toFloatArray();
+        int idx = 0;
+        for (int head = 0; head < h; head++) {
+            for (int pos = 0; pos < N; pos++) {
+                for (int i = 0; i < dK / 2; i++) {
+                    double th = pos / Math.pow(10000.0, (2.0 * i) / dK);
+                    assertEquals(Math.cos(th) + Math.sin(th), g[idx++], 1e-5);
+                    assertEquals(Math.cos(th) - Math.sin(th), g[idx++], 1e-5);
+                }
+            }
+        }
+    }
+
+    @Test
+    @DisplayName("Vectorized RoPE matches the original loop implementation")
+    void testRoPEMatchesReferenceLoop() {
+        int h = 3, N = 5, dK = 8;
+        NDArray x = manager.randomNormal(0.0f, 1.0f, new Shape(h, N, dK), DataType.FLOAT32);
+        float[] in = x.toFloatArray();
+        float[] ref = new float[in.length];
+
+        for (int head = 0; head < h; head++) {
+            for (int pos = 0; pos < N; pos++) {
+                int base = (head * N + pos) * dK;
+                for (int i = 0; i < dK / 2; i++) {
+                    double th = pos / Math.pow(10000.0, (2.0 * i) / dK);
+                    float c = (float) Math.cos(th), s = (float) Math.sin(th);
+                    float x1 = in[base + 2 * i], x2 = in[base + 2 * i + 1];
+                    ref[base + 2 * i] = x1 * c - x2 * s;
+                    ref[base + 2 * i + 1] = x1 * s + x2 * c;
+                }
+            }
+        }
+
+        float[] actual = ModernizedHierarchicalEncoderPipeline.applyRoPE(manager, x).toFloatArray();
+        assertArrayEquals(ref, actual, 1e-5f);
+    }
+
     // =========================================================================
     // NEW AUTOGRAD, CAUSAL MASK & GRADIENT ENGINE TESTS
     // =========================================================================
