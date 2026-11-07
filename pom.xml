@@ -9,77 +9,64 @@
     <version>1.0-SNAPSHOT</version>
 
     <properties>
-        <maven.compiler.source>17</maven.compiler.source>
-        <maven.compiler.target>17</maven.compiler.target>
+        <!-- "release" (rather than source/target) also pins the JDK API level and removes the compiler warning -->
+        <maven.compiler.release>17</maven.compiler.release>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+
+        <!-- One version for every DJL module so they can never drift apart -->
+        <djl.version>0.28.0</djl.version>
+        <junit.version>5.10.2</junit.version>
+
+        <!-- DEFAULT entry point for `mvn exec:java`. Because it is a property (not a hard-coded
+             <configuration>), a command-line -Dexec.mainClass=... overrides it, e.g.
+             mvn exec:java -Dexec.mainClass=com.example.story.TrainStoryModel -Dexec.args="corpus=..." -->
+        <exec.mainClass>com.example.math.ModernizedHierarchicalEncoderPipeline</exec.mainClass>
     </properties>
 
-<dependencies>
-    <dependency>
-        <groupId>org.assertj</groupId>
-        <artifactId>assertj-core</artifactId>
-        <version>3.25.3</version>
-        <scope>test</scope>
-    </dependency>
-    <dependency>
-        <groupId>org.slf4j</groupId>
-        <artifactId>slf4j-simple</artifactId>
-        <version>2.0.12</version>
-    </dependency>
+    <dependencies>
+        <!-- ===== Deep Java Library ===== -->
+        <dependency>
+            <groupId>ai.djl</groupId>
+            <artifactId>api</artifactId>
+            <version>${djl.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>ai.djl.pytorch</groupId>
+            <artifactId>pytorch-engine</artifactId>
+            <version>${djl.version}</version>
+            <scope>runtime</scope>
+        </dependency>
+        <!-- Hugging Face tokenizers / sentence-embedding translator (used by the MiniLM demo pipeline) -->
+        <dependency>
+            <groupId>ai.djl.huggingface</groupId>
+            <artifactId>tokenizers</artifactId>
+            <version>${djl.version}</version>
+        </dependency>
 
-    <!-- JUnit 5 Testing Framework -->
-    <dependency>
-        <groupId>org.junit.jupiter</groupId>
-        <artifactId>junit-jupiter</artifactId>
-        <version>5.10.2</version>
-        <scope>test</scope>
-    </dependency>
+        <!-- ===== Logging =====
+             DJL ships the slf4j 1.7.x API. slf4j-simple 2.x is a provider for the 2.x API, so with it
+             you got "Failed to load class StaticLoggerBinder ... NOP logger". 1.7.36 matches. -->
+        <dependency>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-simple</artifactId>
+            <version>1.7.36</version>
+        </dependency>
 
-    <!-- JUnit 5 API -->
-    <dependency>
-        <groupId>org.junit.jupiter</groupId>
-        <artifactId>junit-jupiter-api</artifactId>
-        <version>5.10.2</version>
-        <scope>test</scope>
-    </dependency>
-    
-    <!-- JUnit 5 Engine -->
-    <dependency>
-        <groupId>org.junit.jupiter</groupId>
-        <artifactId>junit-jupiter-engine</artifactId>
-        <version>5.10.2</version>
-        <scope>test</scope>
-    </dependency>
-
-    <!-- REQUIRED FOR PARAMETERIZED TESTS -->
-    <dependency>
-        <groupId>org.junit.jupiter</groupId>
-        <artifactId>junit-jupiter-params</artifactId>
-        <version>5.10.2</version>
-        <scope>test</scope>
-    </dependency>
-
-    <!-- DJL Core API -->
-    <dependency>
-        <groupId>ai.djl</groupId>
-        <artifactId>api</artifactId>
-        <version>0.26.0</version>
-    </dependency>
-    <!-- DJL PyTorch Engine -->
-    <dependency>
-        <groupId>ai.djl.pytorch</groupId>
-        <artifactId>pytorch-engine</artifactId>
-        <version>0.26.0</version>
-        <scope>runtime</scope>
-    </dependency>
-    <!-- Hugging Face Model Zoo Integration -->
-    <dependency>
-        <groupId>ai.djl.huggingface</groupId>
-        <artifactId>tokenizers</artifactId>
-        <version>0.26.0</version>
-    </dependency>
-
-</dependencies>
+        <!-- ===== Tests =====
+             The junit-jupiter aggregate already brings api + engine + params. -->
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <version>${junit.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.assertj</groupId>
+            <artifactId>assertj-core</artifactId>
+            <version>3.25.3</version>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
 
     <build>
         <plugins>
@@ -87,28 +74,19 @@
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-compiler-plugin</artifactId>
                 <version>3.11.0</version>
-                <configuration>
-                    <source>17</source>
-                    <target>17</target>
-                </configuration>
             </plugin>
+
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-surefire-plugin</artifactId>
                 <version>3.2.5</version>
             </plugin>
+
+            <!-- No <mainClass> here on purpose: it comes from the exec.mainClass property above. -->
             <plugin>
                 <groupId>org.codehaus.mojo</groupId>
                 <artifactId>exec-maven-plugin</artifactId>
                 <version>3.1.1</version>
-                <configuration>
-                    <mainClass>com.example.math.ModernizedHierarchicalEncoderPipeline</mainClass>
-                </configuration>
-            </plugin>
-	    <plugin>
-                <groupId>org.apache.maven.plugins</groupId>
-                <artifactId>maven-surefire-plugin</artifactId>
-                <version>3.2.3</version>
             </plugin>
         </plugins>
     </build>
