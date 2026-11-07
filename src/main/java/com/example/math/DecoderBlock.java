@@ -51,10 +51,31 @@ public class DecoderBlock {
     }
 
     /**
-     * Executes Pre-LN + Causal MHA (RoPE) + SwiGLU FFN pass.
-     * Reuses pre-computed cos and sin tensors.
+     * Holds the block's output tensor alongside its updated K and V cache states.
+     */
+    public static class DecoderBlockResult {
+        public final NDArray output;
+        public final NDArray kCache;
+        public final NDArray vCache;
+
+        public DecoderBlockResult(NDArray output, NDArray kCache, NDArray vCache) {
+            this.output = output;
+            this.kCache = kCache;
+            this.vCache = vCache;
+        }
+    }
+
+    /**
+     * Standard Non-Cached Forward Pass (used during full sequence training).
      */
     public NDArray forward(NDArray X, NDArray causalMask, NDArray cos, NDArray sin) {
+        return forwardWithCache(X, causalMask, cos, sin, null, null).output;
+    }
+
+    /**
+     * Forward pass supporting Layer-level KV-Caching for O(1) step inference.
+     */
+    public DecoderBlockResult forwardWithCache(NDArray X, NDArray causalMask, NDArray cos, NDArray sin, NDArray kCache, NDArray vCache) {
         long seqLen = X.getShape().get(0);
 
         // --- SubLayer 1: Pre-LN Causal Multi-Head Attention ---
@@ -68,14 +89,32 @@ public class DecoderBlock {
         NDArray K_split = K.reshape(new Shape(seqLen, numHeads, dK)).transpose(1, 0, 2);
         NDArray V_split = V.reshape(new Shape(seqLen, numHeads, dK)).transpose(1, 0, 2);
 
-        // Apply pre-computed RoPE cos/sin matrices
+        // Apply pre-computed RoPE cos/sin matrices to new token projections
         NDArray Q_rope = ModernizedHierarchicalEncoderPipeline.applyRoPE(Q_split, cos, sin);
         NDArray K_rope = ModernizedHierarchicalEncoderPipeline.applyRoPE(K_split, cos, sin);
 
-        NDArray rawScores = Q_rope.matMul(K_rope.transpose(0, 2, 1)).div(Math.sqrt(dK));
-        NDArray maskedScores = rawScores.add(causalMask);
-        NDArray attentionWeights = maskedScores.softmax(-1);
+        // Concatenate new Keys and Values with incoming KV-Cache along sequence dimension (dim=1)
+        if (kCache != null && vCache != null) {
+            K_rope = kCache.concat(K_rope, 1);
+            V_split = vCache.concat(V_split, 1);
+        }
 
+        NDArray newKCache = K_rope;
+        NDArray newVCache = V_split;
+
+        long keySeqLen = K_rope.getShape().get(1);
+
+        // Scaled Dot-Product Attention
+        NDArray rawScores = Q_rope.matMul(K_rope.transpose(0, 2, 1)).div(Math.sqrt(dK));
+
+        if (causalMask != null) {
+            // Align mask dimensions if shapes match slice requirements
+            if (causalMask.getShape().get(0) == seqLen && causalMask.getShape().get(1) == keySeqLen) {
+                rawScores = rawScores.add(causalMask);
+            }
+        }
+
+        NDArray attentionWeights = rawScores.softmax(-1);
         NDArray headOutputs = attentionWeights.matMul(V_split);
         NDArray concatOutputs = headOutputs.transpose(1, 0, 2).reshape(new Shape(seqLen, dModel));
         NDArray mhaOutput = concatOutputs.matMul(W_O);
@@ -91,7 +130,9 @@ public class DecoderBlock {
         NDArray ffnHidden = gateSwish.mul(featureLinear);
         NDArray ffnOutput = ffnHidden.matMul(W_2).add(b_2);
 
-        return subLayer1Out.add(ffnOutput);
+        NDArray finalOutput = subLayer1Out.add(ffnOutput);
+
+        return new DecoderBlockResult(finalOutput, newKCache, newVCache);
     }
 
     /**
