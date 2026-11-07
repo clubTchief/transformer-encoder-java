@@ -40,7 +40,6 @@ public class ModernizedHierarchicalEncoderPipeline {
 
             // Initialize Gradient Engine
             GradientEngine gradEngine = new GradientEngine(0.001f);
-            List<NDArray> trainableParameters = new ArrayList<>();
 
             // =========================================================================
             // STAGE 1: SEMANTIC WORD EMBEDDINGS (E)
@@ -56,7 +55,7 @@ public class ModernizedHierarchicalEncoderPipeline {
             explainStage1(tokens, E, rawEmbeddings, dModel);
 
             // =========================================================================
-            // STAGE 2: ROTARY POSITION EMBEDDINGS (RoPE) PREPARATION & CAUSAL MASK
+            // STAGE 2: INITIALIZATION & DECODER BLOCK STACK SETUP (DONE ONCE)
             // =========================================================================
             NDArray P = generatePositionalMatrix(manager, seqLen, dModel);
             NDArray currentX = E.duplicate();
@@ -66,6 +65,16 @@ public class ModernizedHierarchicalEncoderPipeline {
             NDArray causalMask = causalMask4D.squeeze(0).squeeze(0);
 
             explainStage2(tokens, P, currentX, causalMask);
+
+            // Instantiate persistent DecoderBlocks ONCE (No weight re-allocations in forward loop)
+            List<DecoderBlock> blocks = new ArrayList<>();
+            List<NDArray> allTrainableParams = new ArrayList<>();
+
+            for (int l = 0; l < numLayers; l++) {
+                DecoderBlock block = new DecoderBlock(manager, dModel, numHeads, dFF, eps);
+                blocks.add(block);
+                allTrainableParams.addAll(block.params());
+            }
 
             // Polysemous token tracking: "financial bank" (idx 3) vs "river bank" (idx 8)
             int targetBank1 = 3;
@@ -80,43 +89,40 @@ public class ModernizedHierarchicalEncoderPipeline {
             System.out.println("     BEGINNING SEQUENTIAL EXECUTION OF CAUSAL ENCODER PIPELINE (N = 6)    ");
             System.out.println("==========================================================================");
 
-            // Build the stack ONCE: parameters persist across forward passes (required for training).
-            int dK = dModel / numHeads;
-            List<DecoderBlock> blocks = new ArrayList<>();
-            for (int l = 0; l < numLayers; l++) {
-                DecoderBlock block = new DecoderBlock(manager, dModel, numHeads, dFF, eps);
-                blocks.add(block);
-                trainableParameters.addAll(block.params());
-            }
-            NDArray[] ropeTables = buildRoPETables(manager, seqLen, dK); // shared by every layer
-
-            // Open DJL Autograd Collector Tape Context
+            // =========================================================================
+            // STAGE 3: REFACTORED MAIN FORWARD PASS LOOP UNDER GRADIENT COLLECTOR
+            // =========================================================================
             try (GradientCollector collector = gradEngine.createCollector()) {
 
-                // =========================================================================
-                // STAGE 3: SEQUENTIAL 6-LAYER CAUSAL DECODER STACK EXECUTION
-                // =========================================================================
+                // Pre-compute RoPE cos/sin frequencies ONCE per forward pass to eliminate memory leaks
+                int dK = dModel / numHeads;
+                NDArray[] ropeFreqs = precomputeRoPEFrequencies(manager, seqLen, dK);
+                NDArray cos = ropeFreqs[0];
+                NDArray sin = ropeFreqs[1];
+
                 for (int l = 1; l <= numLayers; l++) {
                     System.out.println("\n" + "=".repeat(80));
-                    System.out.println("              >>> CAUSAL TRANSFORMER LAYER " + l + " of " + numLayers + " <<<");
+                    System.out.println("              >>> CAUSAL TRANSFORMER ENCODER LAYER " + l + " of " + numLayers + " <<<");
                     System.out.println("=".repeat(80));
 
-                    DecoderBlock.Trace t = blocks.get(l - 1).forward(currentX, causalMask, ropeTables[0], ropeTables[1]);
+                    DecoderBlock block = blocks.get(l - 1);
+                    NDArray nextX = block.forward(currentX, causalMask, cos, sin);
 
-                    explainLayerMHAStep(tokens, l, numHeads, dModel, dK, t.q(), t.k(), t.v(), t.qSplit(),
-                            t.attention(), t.mhaOutput(), targetBank1);
-                    explainLayerSubLayer1AddNorm(tokens, l, currentX, t.mhaOutput(), t.subLayer1Output(), t.subLayer1Output());
-                    explainLayerFFNStep(tokens, l, dModel, dFF, t.ffnHidden(), t.ffnOutput());
+                    double cosSimPrev = computeCosineSimilarity(currentX.get((long) targetBank1), nextX.get((long) targetBank1));
+                    explainLayerSubLayer2AddNorm(tokens, l, currentX, currentX, nextX, nextX, cosSimPrev, targetBank1);
 
-                    double cosSimPrev = computeCosineSimilarity(currentX.get((long) targetBank1), t.output().get((long) targetBank1));
-                    explainLayerSubLayer2AddNorm(tokens, l, currentX, t.subLayer1Output(), t.ffnOutput(), t.output(), cosSimPrev, targetBank1);
-
-                    // Update input tensor state for the next layer in the stack
-                    currentX = t.output();
+                    currentX = nextX;
                     saveTrajectorySlice(currentX, bank1Trajectory, l, targetBank1);
                     saveTrajectorySlice(currentX, bank2Trajectory, l, targetBank2);
                 }
-            }
+
+                // Compute loss & accumulate gradients across autograd tape
+                NDArray loss = currentX.sum();
+                collector.backward(loss);
+            } // <--- GradientCollector closes here, stopping active tape recording
+
+            // Perform optimizer update AFTER collector closes
+            gradEngine.step(allTrainableParams);
 
             // =========================================================================
             // STAGE 4: DIVERGENCE AUDIT & HIERARCHICAL REFINEMENT SUMMARY
@@ -126,66 +132,55 @@ public class ModernizedHierarchicalEncoderPipeline {
     }
 
     // =========================================================================
-    // LAYER NORMALIZATION, SWISH, AND ROTARY POSITION EMBEDDING HELPERS
+    // EFFICIENT ROPE PRE-COMPUTATION & VECTOR-NATIVE ROTATION HELPERS
     // =========================================================================
 
-    public static NDArray applySwish(NDArray X) {
-        // Swish(x) = x * sigmoid(x) = x / (1 + exp(-x))
-        NDArray denominator = X.neg().exp().add(1.0f);
-        return X.div(denominator);
-    }
-
-    /**
-     * Applies Rotary Position Embeddings (RoPE) using fully differentiable NDArray operations.
-     * Preserves DJL autograd computation graph.
-     * 
-     * @param manager     DJL NDManager
-     * @param splitTensor Input head tensor of shape [numHeads, seqLen, dK]
-     * @return Rotated head tensor of shape [numHeads, seqLen, dK]
-     */
-    /**
-     * Builds the RoPE cos/sin tables as [1, seqLen, dK] constants (each frequency repeated for its
-     * (2i, 2i+1) pair). Build once per forward pass and reuse for every layer and for both Q and K.
-     */
-    public static NDArray[] buildRoPETables(NDManager manager, long seqLen, long dK) {
-        // 1. Theta frequencies: theta_i = 10000^(-2i / dK)
+    public static NDArray[] precomputeRoPEFrequencies(NDManager manager, long seqLen, long dK) {
         float[] invFreq = new float[(int) (dK / 2)];
         for (int i = 0; i < dK / 2; i++) {
             invFreq[i] = (float) (1.0 / Math.pow(10000.0, (2.0 * i) / dK));
         }
-        NDArray invFreqND = manager.create(invFreq); // [dK / 2]
-
-        // 2. Positions 0..seqLen-1, 3. outer product -> freqs [seqLen, dK / 2]
+        NDArray invFreqND = manager.create(invFreq);
         NDArray posND = manager.arange(0, seqLen, 1, DataType.FLOAT32);
+
         NDArray freqs = posND.reshape(new Shape(seqLen, 1)).matMul(invFreqND.reshape(new Shape(1, dK / 2)));
 
-        // 4. Duplicate each frequency for its paired dimensions: [seqLen, dK/2] -> [1, seqLen, dK]
         NDArray cos = freqs.cos().repeat(1, 2).reshape(new Shape(1, seqLen, dK));
         NDArray sin = freqs.sin().repeat(1, 2).reshape(new Shape(1, seqLen, dK));
+
         return new NDArray[]{cos, sin};
     }
 
-    /** RoPE with precomputed tables. Pure NDArray ops, so autograd flows through it. */
     public static NDArray applyRoPE(NDArray splitTensor, NDArray cos, NDArray sin) {
         Shape shape = splitTensor.getShape();
         long numHeads = shape.get(0);
         long seqLen = shape.get(1);
         long dK = shape.get(2);
 
-        // R(X) = [-x2, x1, -x4, x3, ...] via strided slices and interleaving stack
-        NDArray x1 = splitTensor.get("..., 0::2"); // even features
-        NDArray x2 = splitTensor.get("..., 1::2"); // odd features
-        NDArray rx = x2.neg().stack(x1, -1).reshape(new Shape(numHeads, seqLen, dK));
+        NDArray x1 = splitTensor.get("..., 0::2");
+        NDArray x2 = splitTensor.get("..., 1::2");
 
-        // RoPE formula: (X * cos) + (R(X) * sin)
+        NDArray negX2 = x2.neg();
+        NDArray rx = negX2.stack(x1, -1).reshape(new Shape(numHeads, seqLen, dK));
+
         return splitTensor.mul(cos).add(rx.mul(sin));
     }
 
-    /** Convenience wrapper: builds the tables on every call. Prefer the overload above in loops. */
+    /**
+     * Helper overload for unit tests. Pre-computes frequencies dynamically.
+     */
     public static NDArray applyRoPE(NDManager manager, NDArray splitTensor) {
         Shape shape = splitTensor.getShape();
-        NDArray[] tables = buildRoPETables(manager, shape.get(1), shape.get(2));
-        return applyRoPE(splitTensor, tables[0], tables[1]);
+        long seqLen = shape.get(1);
+        long dK = shape.get(2);
+
+        NDArray[] freqs = precomputeRoPEFrequencies(manager, seqLen, dK);
+        return applyRoPE(splitTensor, freqs[0], freqs[1]);
+    }
+
+    public static NDArray applySwish(NDArray X) {
+        NDArray denominator = X.neg().exp().add(1.0f);
+        return X.div(denominator);
     }
 
     public static NDArray generatePositionalMatrix(NDManager manager, int seqLen, int dModel) {
@@ -201,7 +196,7 @@ public class ModernizedHierarchicalEncoderPipeline {
     }
 
     // =========================================================================
-    // STEP-BY-STEP AUDIT LOGGERS (FORMULAE + INTUITION + MATRIX SLICES)
+    // STEP-BY-STEP AUDIT LOGGERS
     // =========================================================================
 
     private static void printHeader() {
@@ -252,67 +247,6 @@ public class ModernizedHierarchicalEncoderPipeline {
             String xStr = String.format("[%.4f, %.4f, %.4f, %.4f]", xArr[i][0], xArr[i][1], xArr[i][2], xArr[i][3]);
             System.out.printf("%-4d | %-12s | %-28s | %-28s%n", i, tokens[i], pStr, xStr);
         }
-        System.out.println("--------------------------------------------------------------------------");
-    }
-
-    private static void explainLayerMHAStep(String[] tokens, int layerIdx, int numHeads, int dModel, int dK,
-                                            NDArray Q, NDArray K, NDArray V, NDArray Q_split,
-                                            NDArray attentionWeights, NDArray mhaOutput, int targetIdx) {
-        System.out.println("\n[LAYER " + layerIdx + " - STEP 1] Multi-Head Attention Sub-layer (Pre-LN + RoPE + Causal Mask)");
-        System.out.println("--------------------------------------------------------------------------");
-        System.out.println("Intuition   : Pre-LN normalizes feature inputs before projection. RoPE rotates Q and K.");
-        System.out.println("Formulas    : LN_In = LayerNorm(X_{l-1}), Q = LN_In * W_Q, K = LN_In * W_K, V = LN_In * W_V");
-        System.out.println("              Q_rope = ApplyRoPE(Q_split), K_rope = ApplyRoPE(K_split)");
-        System.out.println("              Scores = (Q_rope * K_rope^T) / sqrt(d_k) + CausalMask,  A = Softmax(Scores, axis=-1)");
-        System.out.println("Shapes      : Q,K,V: " + Q.getShape() + " | Heads Split: " + Q_split.getShape() + 
-                           " | Softmax A: " + attentionWeights.getShape() + " | MHA Out: " + mhaOutput.getShape() + "\n");
-
-        float[][] qArr = toFloatArray2D(Q);
-        float[][] kArr = toFloatArray2D(K);
-        float[][] vArr = toFloatArray2D(V);
-
-        System.out.println("--- Projection Slices for Token '" + tokens[targetIdx] + "' (Index " + targetIdx + ") ---");
-        String qStr = String.format("[%.4f, %.4f, %.4f, %.4f]", qArr[targetIdx][0], qArr[targetIdx][1], qArr[targetIdx][2], qArr[targetIdx][3]);
-        String kStr = String.format("[%.4f, %.4f, %.4f, %.4f]", kArr[targetIdx][0], kArr[targetIdx][1], kArr[targetIdx][2], kArr[targetIdx][3]);
-        String vStr = String.format("[%.4f, %.4f, %.4f, %.4f]", vArr[targetIdx][0], vArr[targetIdx][1], vArr[targetIdx][2], vArr[targetIdx][3]);
-        System.out.println("  -> Query Q[" + targetIdx + ", 0..3] : " + qStr);
-        System.out.println("  -> Key   K[" + targetIdx + ", 0..3] : " + kStr);
-        System.out.println("  -> Value V[" + targetIdx + ", 0..3] : " + vStr);
-
-        System.out.println("\n--- Head 0 Causal Attention Focus for '" + tokens[targetIdx] + "' (Index " + targetIdx + ") ---");
-        float[] flatWeights = attentionWeights.toFloatArray();
-        int seqLen = tokens.length;
-        printHeadTopWeight(tokens, flatWeights, 0, seqLen, targetIdx);
-        System.out.println("--------------------------------------------------------------------------");
-    }
-
-    private static void explainLayerSubLayer1AddNorm(String[] tokens, int layerIdx, NDArray X_prev, NDArray mhaOut,
-                                                     NDArray subLayer1Residual, NDArray subLayer1Output) {
-        System.out.println("\n[LAYER " + layerIdx + " - STEP 2] SubLayer 1 Pre-LN Residual Highway Addition");
-        System.out.println("--------------------------------------------------------------------------");
-        System.out.println("Intuition   : Pre-LN adds MHA delta updates directly to main stream without normalizing output.");
-        System.out.println("Formulas    : Sub1_Out = X_{l-1} + CausalMHA( LayerNorm(X_{l-1}) )");
-
-        NDArray normMeans = subLayer1Output.mean(new int[]{-1}, true);
-        NDArray normVars = subLayer1Output.sub(normMeans).square().mean(new int[]{-1}, true);
-
-        float[] meanFlat = normMeans.toFloatArray();
-        float[] varFlat = normVars.toFloatArray();
-
-        System.out.printf("Residual Stream Check : Layer %d SubLayer 1 Stream Mean = %.6f | Stream Variance = %.6f%n", 
-                layerIdx, meanFlat[0], varFlat[0]);
-        System.out.println("--------------------------------------------------------------------------");
-    }
-
-    private static void explainLayerFFNStep(String[] tokens, int layerIdx, int dModel, int dFF,
-                                            NDArray ffnHidden, NDArray ffnOutput) {
-        System.out.println("\n[LAYER " + layerIdx + " - STEP 3] Position-wise SwiGLU Feed-Forward Network");
-        System.out.println("--------------------------------------------------------------------------");
-        System.out.println("Intuition   : SwiGLU utilizes parallel gate and feature projections with Swish activation.");
-        System.out.println("Formulas    : Gate    = Swish( LN_In * W_g^{(l)} + b_g^{(l)} )");
-        System.out.println("              Feature = LN_In * W_1^{(l)} + b_1^{(l)}");
-        System.out.println("              FFN_Out = (Gate (x) Feature) * W_2^{(l)} + b_2^{(l)}");
-        System.out.println("Shapes Out  : SwiGLU Hidden Activation: " + ffnHidden.getShape() + " | FFN Output: " + ffnOutput.getShape());
         System.out.println("--------------------------------------------------------------------------");
     }
 
@@ -380,25 +314,6 @@ public class ModernizedHierarchicalEncoderPipeline {
         System.out.println("==========================================================================");
     }
 
-    private static void printHeadTopWeight(String[] tokens, float[] flatWeights, int headIdx, int seqLen, int queryRow) {
-        int headOffset = headIdx * seqLen * seqLen;
-        int rowOffset = headOffset + queryRow * seqLen;
-
-        int maxCol = 0;
-        float maxVal = -1.0f;
-
-        // Restrict search bounds to j <= queryRow to honor Causal Masking
-        for (int j = 0; j <= queryRow; j++) {
-            float val = flatWeights[rowOffset + j];
-            if (val > maxVal) {
-                maxVal = val;
-                maxCol = j;
-            }
-        }
-        System.out.printf("  -> Head %d: '%s' (idx %d) attends causally to '%s' (idx %d) [Weight = %.4f]%n",
-                headIdx, tokens[queryRow], queryRow, tokens[maxCol], maxCol, maxVal);
-    }
-
     private static double computeCosineSimilarity(NDArray vecA, NDArray vecB) {
         float[] a = vecA.toFloatArray();
         float[] b = vecB.toFloatArray();
@@ -415,20 +330,6 @@ public class ModernizedHierarchicalEncoderPipeline {
     private static void saveTrajectorySlice(NDArray matrix, float[][] trajectory, int layer, int tokenIdx) {
         float[] row = matrix.get((long) tokenIdx).toFloatArray();
         System.arraycopy(row, 0, trajectory[layer], 0, 4);
-    }
-
-    private static float[][][] to3DArray(NDArray array, int d0, int d1, int d2) {
-        float[] flat = array.toFloatArray();
-        float[][][] result = new float[d0][d1][d2];
-        int idx = 0;
-        for (int i = 0; i < d0; i++) {
-            for (int j = 0; j < d1; j++) {
-                for (int k = 0; k < d2; k++) {
-                    result[i][j][k] = flat[idx++];
-                }
-            }
-        }
-        return result;
     }
 
     private static float[][] toFloatArray2D(NDArray array) {

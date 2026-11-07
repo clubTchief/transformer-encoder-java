@@ -8,128 +8,126 @@ import ai.djl.ndarray.types.Shape;
 import java.util.ArrayList;
 import java.util.List;
 
-/**
- * One Pre-LN decoder layer: causal multi-head attention with RoPE + SwiGLU feed-forward.
- *
- * Unlike the inline code it replaces, every weight and LayerNorm is created ONCE in the constructor,
- * so the same parameters are reused (and trained) across forward passes. Build the stack before
- * opening the GradientCollector; only call forward() inside it.
- */
 public class DecoderBlock {
-
-    /** Intermediate tensors, kept so the pipeline's explain* printouts still work. */
-    public record Trace(NDArray q, NDArray k, NDArray v, NDArray qSplit, NDArray attention,
-                        NDArray mhaOutput, NDArray subLayer1Output,
-                        NDArray ffnHidden, NDArray ffnOutput, NDArray output) {}
-
-    private final int numHeads;
-    private final int dModel;
-    private final int dK;
 
     private final LayerNorm norm1;
     private final LayerNorm norm2;
-    private final NDArray wQ, wK, wV, wO;
-    private final NDArray wGate, bGate, w1, b1, w2, b2;
+
+    private final NDArray W_Q, W_K, W_V, W_O;
+    private final NDArray W_gate, b_gate, W_1, b_1, W_2, b_2;
+
+    private final int dModel;
+    private final int numHeads;
+    private final int dK;
 
     public DecoderBlock(NDManager manager, int dModel, int numHeads, int dFF, float eps) {
-        if (dModel % numHeads != 0) {
-            throw new IllegalArgumentException("dModel must be divisible by numHeads");
-        }
         this.dModel = dModel;
         this.numHeads = numHeads;
         this.dK = dModel / numHeads;
 
-        norm1 = new LayerNorm(manager, dModel, eps);
-        norm2 = new LayerNorm(manager, dModel, eps);
+        // 1. LayerNorms
+        this.norm1 = new LayerNorm(manager, dModel, eps);
+        this.norm2 = new LayerNorm(manager, dModel, eps);
 
-        float stdAttn = (float) Math.sqrt(2.0 / (dModel + dK));
-        float stdO = (float) Math.sqrt(2.0 / (dModel + dModel));
-        wQ = param(manager, stdAttn, new Shape(dModel, dModel));
-        wK = param(manager, stdAttn, new Shape(dModel, dModel));
-        wV = param(manager, stdAttn, new Shape(dModel, dModel));
-        wO = param(manager, stdO, new Shape(dModel, dModel));
+        // 2. Multi-Head Attention Weights
+        float stddevK = (float) Math.sqrt(2.0 / (dModel + dK));
+        float stddevO = (float) Math.sqrt(2.0 / (dModel + dModel));
 
-        float std1 = (float) Math.sqrt(2.0 / (dModel + dFF));
-        float std2 = (float) Math.sqrt(2.0 / (dFF + dModel));
-        wGate = param(manager, std1, new Shape(dModel, dFF));
-        bGate = zeros(manager, new Shape(dFF));
-        w1 = param(manager, std1, new Shape(dModel, dFF));
-        b1 = zeros(manager, new Shape(dFF));
-        w2 = param(manager, std2, new Shape(dFF, dModel));
-        b2 = zeros(manager, new Shape(dModel));
+        this.W_Q = createWeight(manager, new Shape(dModel, dModel), stddevK);
+        this.W_K = createWeight(manager, new Shape(dModel, dModel), stddevK);
+        this.W_V = createWeight(manager, new Shape(dModel, dModel), stddevK);
+        this.W_O = createWeight(manager, new Shape(dModel, dModel), stddevO);
+
+        // 3. SwiGLU FFN Weights & Biases
+        float stddev1 = (float) Math.sqrt(2.0 / (dModel + dFF));
+        float stddev2 = (float) Math.sqrt(2.0 / (dFF + dModel));
+
+        this.W_gate = createWeight(manager, new Shape(dModel, dFF), stddev1);
+        this.b_gate = createBias(manager, new Shape(dFF));
+        this.W_1 = createWeight(manager, new Shape(dModel, dFF), stddev1);
+        this.b_1 = createBias(manager, new Shape(dFF));
+        this.W_2 = createWeight(manager, new Shape(dFF, dModel), stddev2);
+        this.b_2 = createBias(manager, new Shape(dModel));
     }
 
     /**
-     * @param x        [seqLen, dModel]
-     * @param mask     additive causal mask [seqLen, seqLen]
-     * @param ropeCos  from ModernizedHierarchicalEncoderPipeline.buildRoPETables
-     * @param ropeSin  from ModernizedHierarchicalEncoderPipeline.buildRoPETables
+     * Executes Pre-LN + Causal MHA (RoPE) + SwiGLU FFN pass.
+     * Reuses pre-computed cos and sin tensors.
      */
-    public Trace forward(NDArray x, NDArray mask, NDArray ropeCos, NDArray ropeSin) {
-        long seqLen = x.getShape().get(0);
+    public NDArray forward(NDArray X, NDArray causalMask, NDArray cos, NDArray sin) {
+        long seqLen = X.getShape().get(0);
 
-        // ---- SubLayer 1: Pre-LN + RoPE multi-head attention with causal mask ----
-        NDArray n1 = norm1.forward(x);
-        NDArray q = n1.matMul(wQ);
-        NDArray k = n1.matMul(wK);
-        NDArray v = n1.matMul(wV);
+        // --- SubLayer 1: Pre-LN Causal Multi-Head Attention ---
+        NDArray normX1 = norm1.forward(X);
 
-        NDArray qSplit = q.reshape(new Shape(seqLen, numHeads, dK)).transpose(1, 0, 2);
-        NDArray kSplit = k.reshape(new Shape(seqLen, numHeads, dK)).transpose(1, 0, 2);
-        NDArray vSplit = v.reshape(new Shape(seqLen, numHeads, dK)).transpose(1, 0, 2);
+        NDArray Q = normX1.matMul(W_Q);
+        NDArray K = normX1.matMul(W_K);
+        NDArray V = normX1.matMul(W_V);
 
-        NDArray qRope = ModernizedHierarchicalEncoderPipeline.applyRoPE(qSplit, ropeCos, ropeSin);
-        NDArray kRope = ModernizedHierarchicalEncoderPipeline.applyRoPE(kSplit, ropeCos, ropeSin);
+        NDArray Q_split = Q.reshape(new Shape(seqLen, numHeads, dK)).transpose(1, 0, 2);
+        NDArray K_split = K.reshape(new Shape(seqLen, numHeads, dK)).transpose(1, 0, 2);
+        NDArray V_split = V.reshape(new Shape(seqLen, numHeads, dK)).transpose(1, 0, 2);
 
-        NDArray scores = qRope.matMul(kRope.transpose(0, 2, 1)).div(Math.sqrt(dK)).add(mask);
-        NDArray attention = scores.softmax(-1);
-        NDArray heads = attention.matMul(vSplit);
-        NDArray mhaOutput = heads.transpose(1, 0, 2).reshape(new Shape(seqLen, dModel)).matMul(wO);
-        NDArray subLayer1Output = x.add(mhaOutput);
+        // Apply pre-computed RoPE cos/sin matrices
+        NDArray Q_rope = ModernizedHierarchicalEncoderPipeline.applyRoPE(Q_split, cos, sin);
+        NDArray K_rope = ModernizedHierarchicalEncoderPipeline.applyRoPE(K_split, cos, sin);
 
-        // ---- SubLayer 2: Pre-LN + SwiGLU feed-forward ----
-        NDArray n2 = norm2.forward(subLayer1Output);
-        NDArray gate = ModernizedHierarchicalEncoderPipeline.applySwish(n2.matMul(wGate).add(bGate));
-        NDArray ffnHidden = gate.mul(n2.matMul(w1).add(b1));
-        NDArray ffnOutput = ffnHidden.matMul(w2).add(b2);
-        NDArray output = subLayer1Output.add(ffnOutput);
+        NDArray rawScores = Q_rope.matMul(K_rope.transpose(0, 2, 1)).div(Math.sqrt(dK));
+        NDArray maskedScores = rawScores.add(causalMask);
+        NDArray attentionWeights = maskedScores.softmax(-1);
 
-        return new Trace(q, k, v, qSplit, attention, mhaOutput, subLayer1Output, ffnHidden, ffnOutput, output);
+        NDArray headOutputs = attentionWeights.matMul(V_split);
+        NDArray concatOutputs = headOutputs.transpose(1, 0, 2).reshape(new Shape(seqLen, dModel));
+        NDArray mhaOutput = concatOutputs.matMul(W_O);
+
+        NDArray subLayer1Out = X.add(mhaOutput);
+
+        // --- SubLayer 2: Pre-LN SwiGLU Feed-Forward Network ---
+        NDArray normX2 = norm2.forward(subLayer1Out);
+
+        NDArray gateLinear = normX2.matMul(W_gate).add(b_gate);
+        NDArray gateSwish = ModernizedHierarchicalEncoderPipeline.applySwish(gateLinear);
+        NDArray featureLinear = normX2.matMul(W_1).add(b_1);
+        NDArray ffnHidden = gateSwish.mul(featureLinear);
+        NDArray ffnOutput = ffnHidden.matMul(W_2).add(b_2);
+
+        return subLayer1Out.add(ffnOutput);
     }
 
-    public NDArray apply(NDArray x, NDArray mask, NDArray ropeCos, NDArray ropeSin) {
-        return forward(x, mask, ropeCos, ropeSin).output();
-    }
-
-    /** All trainable tensors of this block, in a fixed order. */
+    /**
+     * Returns all registered learnable parameters in this block for optimization.
+     */
     public List<NDArray> params() {
-        List<NDArray> p = new ArrayList<>();
-        p.add(norm1.getGamma());
-        p.add(norm1.getBeta());
-        p.add(wQ);
-        p.add(wK);
-        p.add(wV);
-        p.add(wO);
-        p.add(norm2.getGamma());
-        p.add(norm2.getBeta());
-        p.add(wGate);
-        p.add(bGate);
-        p.add(w1);
-        p.add(b1);
-        p.add(w2);
-        p.add(b2);
-        return p;
+        List<NDArray> parameters = new ArrayList<>();
+        parameters.add(norm1.getGamma());
+        parameters.add(norm1.getBeta());
+        parameters.add(norm2.getGamma());
+        parameters.add(norm2.getBeta());
+        parameters.addAll(List.of(W_Q, W_K, W_V, W_O, W_gate, b_gate, W_1, b_1, W_2, b_2));
+        return parameters;
     }
 
-    private static NDArray param(NDManager manager, float std, Shape shape) {
-        NDArray a = manager.randomNormal(0.0f, std, shape, DataType.FLOAT32);
-        a.setRequiresGradient(true);
-        return a;
+    private NDArray createWeight(NDManager manager, Shape shape, float stddev) {
+        NDArray weight = manager.randomNormal(0.0f, stddev, shape, DataType.FLOAT32);
+        weight.setRequiresGradient(true);
+        return weight;
     }
 
-    private static NDArray zeros(NDManager manager, Shape shape) {
-        NDArray a = manager.zeros(shape, DataType.FLOAT32);
-        a.setRequiresGradient(true);
-        return a;
+    private NDArray createBias(NDManager manager, Shape shape) {
+        NDArray bias = manager.zeros(shape, DataType.FLOAT32);
+        bias.setRequiresGradient(true);
+        return bias;
+    }
+
+    public static class Trace {
+        private final NDArray output;
+
+        public Trace(NDArray output) {
+            this.output = output;
+        }
+
+        public NDArray getOutput() {
+            return this.output;
+        }
     }
 }

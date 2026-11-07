@@ -73,7 +73,12 @@ class ModernizedHierarchicalEncoderPipelineTest {
         int h = 2, N = 4, dK = 8;
         NDArray splitTensor = manager.ones(new Shape(h, N, dK));
 
-        NDArray ropeTensor = ModernizedHierarchicalEncoderPipeline.applyRoPE(manager, splitTensor);
+        // Pre-compute cos and sin matrices for length N and dimension dK
+        NDArray[] freqs = ModernizedHierarchicalEncoderPipeline.precomputeRoPEFrequencies(manager, N, dK);
+        NDArray cos = freqs[0];
+        NDArray sin = freqs[1];
+
+        NDArray ropeTensor = ModernizedHierarchicalEncoderPipeline.applyRoPE(splitTensor, cos, sin);
 
         assertEquals(new Shape(h, N, dK), ropeTensor.getShape());
         assertNotNull(ropeTensor.toFloatArray());
