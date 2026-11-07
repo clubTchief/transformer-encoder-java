@@ -41,6 +41,8 @@ public class GradientEngine {
                         // Replace internal tensor value cleanly without in-place PyTorch leaf mutation
                         param.set(updated.toFloatArray());
                     }
+                    // Reset so the next backward() starts from zero instead of accumulating onto this step's gradient
+                    grad.muli(0f);
                 }
             }
         }

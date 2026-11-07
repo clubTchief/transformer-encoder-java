@@ -118,16 +118,4 @@ public class DecoderBlock {
         bias.setRequiresGradient(true);
         return bias;
     }
-
-    public static class Trace {
-        private final NDArray output;
-
-        public Trace(NDArray output) {
-            this.output = output;
-        }
-
-        public NDArray getOutput() {
-            return this.output;
-        }
-    }
 }

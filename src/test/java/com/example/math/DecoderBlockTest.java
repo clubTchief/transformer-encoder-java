@@ -121,12 +121,40 @@ class DecoderBlockTest {
     }
 
     @Test
-    @DisplayName("Verify DecoderBlock.Trace wrapper holds output correctly")
-    void testTraceInnerClass() {
-        NDArray dummyOutput = manager.ones(new Shape(4, 384));
-        DecoderBlock.Trace trace = new DecoderBlock.Trace(dummyOutput);
+    @DisplayName("Causality: changing the last token never changes earlier positions")
+    void testCausality() {
+        int n = 6, d = 16;
+        DecoderBlock block = new DecoderBlock(manager, d, 2, 32, 1e-5f);
+        NDArray mask = CausalMaskGenerator.createCausalMask(manager, n).squeeze(0).squeeze(0);
+        NDArray[] rope = ModernizedHierarchicalEncoderPipeline.precomputeRoPEFrequencies(manager, n, d / 2);
 
-        assertNotNull(trace.getOutput());
-        assertEquals(new Shape(4, 384), trace.getOutput().getShape());
+        float[][] base = new float[n][d];
+        for (int i = 0; i < n; i++) for (int j = 0; j < d; j++) base[i][j] = (float) Math.sin(i * 31 + j);
+        float[][] changed = new float[n][];
+        for (int i = 0; i < n; i++) changed[i] = base[i].clone();
+        for (int j = 0; j < d; j++) changed[n - 1][j] += 5.0f; // perturb ONLY the last token
+
+        float[] a = block.forward(manager.create(base), mask, rope[0], rope[1]).toFloatArray();
+        float[] b = block.forward(manager.create(changed), mask, rope[0], rope[1]).toFloatArray();
+
+        for (int i = 0; i < (n - 1) * d; i++) {
+            assertEquals(a[i], b[i], 1e-5f, "Earlier position changed at flat index " + i);
+        }
+        boolean lastDiffers = false;
+        for (int i = (n - 1) * d; i < n * d; i++) lastDiffers |= Math.abs(a[i] - b[i]) > 1e-5f;
+        assertTrue(lastDiffers, "The perturbed token itself should change");
+    }
+
+    @Test
+    @DisplayName("Parameters persist: two forward passes on the same input give identical output")
+    void testParametersPersistAcrossForwardPasses() {
+        int n = 4, d = 16;
+        DecoderBlock block = new DecoderBlock(manager, d, 2, 32, 1e-5f);
+        NDArray mask = CausalMaskGenerator.createCausalMask(manager, n).squeeze(0).squeeze(0);
+        NDArray[] rope = ModernizedHierarchicalEncoderPipeline.precomputeRoPEFrequencies(manager, n, d / 2);
+        NDArray x = manager.randomNormal(0.0f, 1.0f, new Shape(n, d), DataType.FLOAT32);
+
+        assertArrayEquals(block.forward(x, mask, rope[0], rope[1]).toFloatArray(),
+                block.forward(x, mask, rope[0], rope[1]).toFloatArray(), 1e-6f);
     }
 }
