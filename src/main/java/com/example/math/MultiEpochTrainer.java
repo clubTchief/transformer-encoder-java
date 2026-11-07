@@ -6,6 +6,7 @@ import ai.djl.ndarray.types.DataType;
 import ai.djl.ndarray.types.Shape;
 import ai.djl.training.GradientCollector;
 
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -120,6 +121,16 @@ public class MultiEpochTrainer {
             System.out.printf("Initial Loss: %.6f | Final Loss: %.6f | Total Loss Reduction: %.2f%%\n",
                     initialLoss, finalLoss, ((initialLoss - finalLoss) / initialLoss) * 100.0f);
             System.out.println("================================================================================");
+
+            // ================================================================================
+            //            >>> SERIALIZING TRAINED MODEL WEIGHTS <<<
+            // ================================================================================
+            String checkpointPath = "models/story_model.bin";
+            try {
+                ModelSerializer.saveWeights(checkpointPath, fullTrainableParams);
+            } catch (IOException e) {
+                System.err.println("Failed to serialize model parameters: " + e.getMessage());
+            }
 
             // ================================================================================
             //            >>> GENERATING STORY FROM TRAINED WEIGHTS <<<                       
