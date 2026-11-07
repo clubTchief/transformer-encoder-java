@@ -53,7 +53,12 @@ public class ModernizedHierarchicalEncoderPipeline {
             NDArray P = generatePositionalMatrix(manager, seqLen, dModel);
             NDArray currentX = E.duplicate(); // In RoPE, positions are applied to Q and K directly inside heads
 
-            explainStage2(tokens, P, currentX);
+            // Create the 4D Additive Causal Mask Matrix [1, 1, seqLen, seqLen] via CausalMaskGenerator
+            // Generate 4D mask and squeeze down to 2D [seqLen, seqLen] for clean 3D broadcasting
+            NDArray causalMask4D = CausalMaskGenerator.createCausalMask(manager, seqLen);
+            NDArray causalMask = causalMask4D.squeeze(0).squeeze(0); // Shape becomes [seqLen, seqLen]
+
+            explainStage2(tokens, P, currentX, causalMask);
 
             // Polysemous token tracking: "financial bank" (idx 3) vs "river bank" (idx 8)
             int targetBank1 = 3;
@@ -65,18 +70,18 @@ public class ModernizedHierarchicalEncoderPipeline {
             saveTrajectorySlice(currentX, bank2Trajectory, 0, targetBank2);
 
             System.out.println("==========================================================================");
-            System.out.println("     BEGINNING SEQUENTIAL EXECUTION OF STACKED ENCODER PIPELINE (N = 6)    ");
+            System.out.println("     BEGINNING SEQUENTIAL EXECUTION OF CAUSAL ENCODER PIPELINE (N = 6)    ");
             System.out.println("==========================================================================");
 
             // =========================================================================
-            // STAGE 3: SEQUENTIAL 6-LAYER ENCODER STACK EXECUTION (Pre-LN + RoPE + SwiGLU)
+            // STAGE 3: SEQUENTIAL 6-LAYER ENCODER STACK EXECUTION (Pre-LN + RoPE + SwiGLU + Causal Mask)
             // =========================================================================
             for (int l = 1; l <= numLayers; l++) {
                 System.out.println("\n" + "=".repeat(80));
-                System.out.println("                    >>> TRANSFORMER ENCODER LAYER " + l + " of " + numLayers + " <<<");
+                System.out.println("              >>> CAUSAL TRANSFORMER ENCODER LAYER " + l + " of " + numLayers + " <<<");
                 System.out.println("=".repeat(80));
 
-                // --- SubLayer 1: Pre-LN + RoPE Multi-Head Attention ---
+                // --- SubLayer 1: Pre-LN + RoPE Multi-Head Attention with Causal Mask ---
                 NDArray norm1 = applyLayerNorm(manager, currentX, eps);
 
                 int dK = dModel / numHeads;
@@ -93,19 +98,25 @@ public class ModernizedHierarchicalEncoderPipeline {
                 NDArray K = norm1.matMul(W_K);
                 NDArray V = norm1.matMul(W_V);
 
-                NDArray Q_split = Q.reshape(new Shape(seqLen, numHeads, dK)).transpose(1, 0, 2);
-                NDArray K_split = K.reshape(new Shape(seqLen, numHeads, dK)).transpose(1, 0, 2);
-                NDArray V_split = V.reshape(new Shape(seqLen, numHeads, dV)).transpose(1, 0, 2);
+                NDArray Q_split = Q.reshape(new Shape(seqLen, numHeads, dK)).transpose(1, 0, 2); // [numHeads, seqLen, dK]
+                NDArray K_split = K.reshape(new Shape(seqLen, numHeads, dK)).transpose(1, 0, 2); // [numHeads, seqLen, dK]
+                NDArray V_split = V.reshape(new Shape(seqLen, numHeads, dV)).transpose(1, 0, 2); // [numHeads, seqLen, dV]
 
-                // Apply Rotary Position Embeddings (RoPE) to Q and K head representations
-                NDArray Q_rope = applyRoPE(manager, Q_split);
-                NDArray K_rope = applyRoPE(manager, K_split);
+                // Apply Rotary Position Embeddings (RoPE)
+                NDArray Q_rope = applyRoPE(manager, Q_split); // [numHeads, seqLen, dK]
+                NDArray K_rope = applyRoPE(manager, K_split); // [numHeads, seqLen, dK]
 
-                NDArray K_transposed = K_rope.transpose(0, 2, 1);
-                NDArray scores = Q_rope.matMul(K_transposed).div(Math.sqrt(dK));
-                NDArray attentionWeights = scores.softmax(-1);
+                // Transpose last two dimensions explicitly: [numHeads, seqLen, dK] -> [numHeads, dK, seqLen]
+                NDArray K_transposed = K_rope.transpose(0, 2, 1); 
 
-                NDArray headOutputs = attentionWeights.matMul(V_split);
+                // Raw Scaled Dot-Product Scores: [numHeads, seqLen, dK] x [numHeads, dK, seqLen] -> [numHeads, seqLen, seqLen]
+                NDArray rawScores = Q_rope.matMul(K_transposed).div(Math.sqrt(dK));
+
+                // Additive Causal Mask Injection: [numHeads, seqLen, seqLen] + [seqLen, seqLen]
+                NDArray maskedScores = rawScores.add(causalMask);
+                NDArray attentionWeights = maskedScores.softmax(-1);
+
+                NDArray headOutputs = attentionWeights.matMul(V_split); // [numHeads, seqLen, dV]
                 NDArray concatOutputs = headOutputs.transpose(1, 0, 2).reshape(new Shape(seqLen, dModel));
                 NDArray mhaOutput = concatOutputs.matMul(W_O);
 
@@ -255,13 +266,15 @@ public class ModernizedHierarchicalEncoderPipeline {
         System.out.println("--------------------------------------------------------------------------");
     }
 
-    private static void explainStage2(String[] tokens, NDArray P, NDArray X_0) {
+    private static void explainStage2(String[] tokens, NDArray P, NDArray X_0, NDArray causalMask) {
         System.out.println("\n[STAGE 2] ROTARY POSITION EMBEDDINGS (RoPE) PREPARATION & COMPOSITION (X_0 = E)");
         System.out.println("--------------------------------------------------------------------------");
         System.out.println("Intuition   : In Modern Pre-LN RoPE Transformer, positions are applied via 2D matrix rotations");
         System.out.println("              directly to Query and Key head tensors, leaving initial X_0 un-added.");
+        System.out.println("Causal Mask : Upper-triangular matrix set to -1e9f to prevent future token leakage (j > i).");
         System.out.println("Formulas    : R_{theta, m} = [[cos(m*theta), -sin(m*theta)], [sin(m*theta), cos(m*theta)]]");
         System.out.println("              X_0 = E in R^{N x d_model}");
+        System.out.println("Mask Shape  : " + causalMask.getShape());
         System.out.println("Output Shape: " + X_0.getShape() + "\n");
 
         float[][] pArr = toFloatArray2D(P);
@@ -281,12 +294,12 @@ public class ModernizedHierarchicalEncoderPipeline {
     private static void explainLayerMHAStep(String[] tokens, int layerIdx, int numHeads, int dModel, int dK,
                                             NDArray Q, NDArray K, NDArray V, NDArray Q_split,
                                             NDArray attentionWeights, NDArray mhaOutput, int targetIdx) {
-        System.out.println("\n[LAYER " + layerIdx + " - STEP 1] Multi-Head Attention Sub-layer (Pre-LN + RoPE)");
+        System.out.println("\n[LAYER " + layerIdx + " - STEP 1] Multi-Head Attention Sub-layer (Pre-LN + RoPE + Causal Mask)");
         System.out.println("--------------------------------------------------------------------------");
         System.out.println("Intuition   : Pre-LN normalizes feature inputs before projection. RoPE rotates Q and K.");
         System.out.println("Formulas    : LN_In = LayerNorm(X_{l-1}), Q = LN_In * W_Q, K = LN_In * W_K, V = LN_In * W_V");
         System.out.println("              Q_rope = ApplyRoPE(Q_split), K_rope = ApplyRoPE(K_split)");
-        System.out.println("              Scores = (Q_rope * K_rope^T) / sqrt(d_k),  A = Softmax(Scores, axis=-1)");
+        System.out.println("              Scores = (Q_rope * K_rope^T) / sqrt(d_k) + CausalMask,  A = Softmax(Scores, axis=-1)");
         System.out.println("Shapes      : Q,K,V: " + Q.getShape() + " | Heads Split: " + Q_split.getShape() + 
                            " | Softmax A: " + attentionWeights.getShape() + " | MHA Out: " + mhaOutput.getShape() + "\n");
 
@@ -302,7 +315,7 @@ public class ModernizedHierarchicalEncoderPipeline {
         System.out.println("  -> Key   K[" + targetIdx + ", 0..3] : " + kStr);
         System.out.println("  -> Value V[" + targetIdx + ", 0..3] : " + vStr);
 
-        System.out.println("\n--- Head 0 Top Attention Focus for '" + tokens[targetIdx] + "' (Index " + targetIdx + ") ---");
+        System.out.println("\n--- Head 0 Causal Attention Focus for '" + tokens[targetIdx] + "' (Index " + targetIdx + ") ---");
         float[] flatWeights = attentionWeights.toFloatArray();
         int seqLen = tokens.length;
         printHeadTopWeight(tokens, flatWeights, 0, seqLen, targetIdx);
@@ -314,7 +327,7 @@ public class ModernizedHierarchicalEncoderPipeline {
         System.out.println("\n[LAYER " + layerIdx + " - STEP 2] SubLayer 1 Pre-LN Residual Highway Addition");
         System.out.println("--------------------------------------------------------------------------");
         System.out.println("Intuition   : Pre-LN adds MHA delta updates directly to main stream without normalizing output.");
-        System.out.println("Formulas    : Sub1_Out = X_{l-1} + MHA( LayerNorm(X_{l-1}) )");
+        System.out.println("Formulas    : Sub1_Out = X_{l-1} + CausalMHA( LayerNorm(X_{l-1}) )");
 
         NDArray normMeans = subLayer1Output.mean(new int[]{-1}, true);
         NDArray normVars = subLayer1Output.sub(normMeans).square().mean(new int[]{-1}, true);
@@ -365,7 +378,7 @@ public class ModernizedHierarchicalEncoderPipeline {
     private static void explainStackingTrajectorySummary(String[] tokens, int idx1, int idx2,
                                                           float[][] traj1, float[][] traj2) {
         System.out.println("\n" + "=".repeat(88));
-        System.out.println("   MODERNIZED POLYSEMY DISAMBIGUATION & STACKING TRAJECTORY SUMMARY (V6)   ");
+        System.out.println("   MODERNIZED CAUSAL POLYSEMY DISAMBIGUATION & STACKING TRAJECTORY SUMMARY (V6)   ");
         System.out.println("=".repeat(88));
         System.out.println("Passage Excerpt: '...financial bank [idx 3] ... river bank [idx 8]...'");
         System.out.println("Core Objective : Evidence how un-adulterated embeddings (X_0) refine across Pre-LN/RoPE/SwiGLU layers.");
@@ -378,11 +391,11 @@ public class ModernizedHierarchicalEncoderPipeline {
 
         String[] descriptions = {
             "Static Lexical Embedding (Un-adulterated E)",
-            "Pre-LN RoPE Local Grammatical & Part-of-Speech Association",
-            "Mid-range Clause Disambiguation via RoPE Relative Rotation",
+            "Pre-LN RoPE Causal Grammatical & Part-of-Speech Association",
+            "Mid-range Causal Clause Disambiguation via RoPE Relative Rotation",
             "Coreference Linkage via SwiGLU Gated Activation ('financial bank' -> 'its vault')",
             "Multi-Hop Causal Reasoning ('floodwaters' -> 'reserve')",
-            "Global Sentence Synthesis & Pre-LN Stream Alignment",
+            "Global Sentence Synthesis & Pre-LN Causal Stream Alignment",
             "Final Fully-Enriched Deep Contextual Representation"
         };
 
@@ -410,14 +423,15 @@ public class ModernizedHierarchicalEncoderPipeline {
         int maxCol = 0;
         float maxVal = -1.0f;
 
-        for (int j = 0; j < seqLen; j++) {
+        // Restrict search bounds to j <= queryRow to honor Causal Masking
+        for (int j = 0; j <= queryRow; j++) {
             float val = flatWeights[rowOffset + j];
             if (val > maxVal) {
                 maxVal = val;
                 maxCol = j;
             }
         }
-        System.out.printf("  -> Head %d: '%s' (idx %d) attends most heavily to '%s' (idx %d) [Weight = %.4f]%n",
+        System.out.printf("  -> Head %d: '%s' (idx %d) attends causally to '%s' (idx %d) [Weight = %.4f]%n",
                 headIdx, tokens[queryRow], queryRow, tokens[maxCol], maxCol, maxVal);
     }
 
