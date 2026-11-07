@@ -8,6 +8,10 @@ import ai.djl.ndarray.types.DataType;
 import ai.djl.ndarray.types.Shape;
 import ai.djl.repository.zoo.Criteria;
 import ai.djl.repository.zoo.ZooModel;
+import ai.djl.training.GradientCollector;
+
+import java.util.ArrayList;
+import java.util.List;
 
 public class ModernizedHierarchicalEncoderPipeline {
 
@@ -34,6 +38,10 @@ public class ModernizedHierarchicalEncoderPipeline {
              Predictor<String, float[]> predictor = model.newPredictor();
              NDManager manager = NDManager.newBaseManager()) {
 
+            // Initialize Gradient Engine
+            GradientEngine gradEngine = new GradientEngine(0.001f);
+            List<NDArray> trainableParameters = new ArrayList<>();
+
             // =========================================================================
             // STAGE 1: SEMANTIC WORD EMBEDDINGS (E)
             // =========================================================================
@@ -48,15 +56,14 @@ public class ModernizedHierarchicalEncoderPipeline {
             explainStage1(tokens, E, rawEmbeddings, dModel);
 
             // =========================================================================
-            // STAGE 2: ROTARY POSITION EMBEDDINGS (RoPE) PREPARATION & COMPOSITION (X_0 = E)
+            // STAGE 2: ROTARY POSITION EMBEDDINGS (RoPE) PREPARATION & CAUSAL MASK
             // =========================================================================
             NDArray P = generatePositionalMatrix(manager, seqLen, dModel);
-            NDArray currentX = E.duplicate(); // In RoPE, positions are applied to Q and K directly inside heads
+            NDArray currentX = E.duplicate();
 
-            // Create the 4D Additive Causal Mask Matrix [1, 1, seqLen, seqLen] via CausalMaskGenerator
-            // Generate 4D mask and squeeze down to 2D [seqLen, seqLen] for clean 3D broadcasting
+            // Create 4D mask and squeeze to 2D [seqLen, seqLen] for broadcast multiplication
             NDArray causalMask4D = CausalMaskGenerator.createCausalMask(manager, seqLen);
-            NDArray causalMask = causalMask4D.squeeze(0).squeeze(0); // Shape becomes [seqLen, seqLen]
+            NDArray causalMask = causalMask4D.squeeze(0).squeeze(0);
 
             explainStage2(tokens, P, currentX, causalMask);
 
@@ -73,92 +80,124 @@ public class ModernizedHierarchicalEncoderPipeline {
             System.out.println("     BEGINNING SEQUENTIAL EXECUTION OF CAUSAL ENCODER PIPELINE (N = 6)    ");
             System.out.println("==========================================================================");
 
-            // =========================================================================
-            // STAGE 3: SEQUENTIAL 6-LAYER ENCODER STACK EXECUTION (Pre-LN + RoPE + SwiGLU + Causal Mask)
-            // =========================================================================
-            for (int l = 1; l <= numLayers; l++) {
-                System.out.println("\n" + "=".repeat(80));
-                System.out.println("              >>> CAUSAL TRANSFORMER ENCODER LAYER " + l + " of " + numLayers + " <<<");
-                System.out.println("=".repeat(80));
+            // Open DJL Autograd Collector Tape Context
+            try (GradientCollector collector = gradEngine.createCollector()) {
 
-                // --- SubLayer 1: Pre-LN + RoPE Multi-Head Attention with Causal Mask ---
-                NDArray norm1 = applyLayerNorm(manager, currentX, eps);
+                // =========================================================================
+                // STAGE 3: SEQUENTIAL 6-LAYER CAUSAL ENCODER STACK EXECUTION
+                // =========================================================================
+                for (int l = 1; l <= numLayers; l++) {
+                    System.out.println("\n" + "=".repeat(80));
+                    System.out.println("              >>> CAUSAL TRANSFORMER ENCODER LAYER " + l + " of " + numLayers + " <<<");
+                    System.out.println("=".repeat(80));
 
-                int dK = dModel / numHeads;
-                int dV = dK;
-                float stddevK = (float) Math.sqrt(2.0 / (dModel + dK));
-                float stddevO = (float) Math.sqrt(2.0 / (dModel + dModel));
+                    // Layer Normalization Blocks with learnable persistent parameters
+                    LayerNorm normLayer1 = new LayerNorm(manager, dModel, eps);
+                    LayerNorm normLayer2 = new LayerNorm(manager, dModel, eps);
+                    
+                    trainableParameters.add(normLayer1.getGamma());
+                    trainableParameters.add(normLayer1.getBeta());
+                    trainableParameters.add(normLayer2.getGamma());
+                    trainableParameters.add(normLayer2.getBeta());
 
-                NDArray W_Q = manager.randomNormal(0.0f, stddevK, new Shape(dModel, dModel), DataType.FLOAT32);
-                NDArray W_K = manager.randomNormal(0.0f, stddevK, new Shape(dModel, dModel), DataType.FLOAT32);
-                NDArray W_V = manager.randomNormal(0.0f, stddevK, new Shape(dModel, dModel), DataType.FLOAT32);
-                NDArray W_O = manager.randomNormal(0.0f, stddevO, new Shape(dModel, dModel), DataType.FLOAT32);
+                    // --- SubLayer 1: Pre-LN + RoPE Multi-Head Attention with Causal Mask ---
+                    NDArray norm1 = normLayer1.forward(currentX);
 
-                NDArray Q = norm1.matMul(W_Q);
-                NDArray K = norm1.matMul(W_K);
-                NDArray V = norm1.matMul(W_V);
+                    int dK = dModel / numHeads;
+                    int dV = dK;
+                    float stddevK = (float) Math.sqrt(2.0 / (dModel + dK));
+                    float stddevO = (float) Math.sqrt(2.0 / (dModel + dModel));
 
-                NDArray Q_split = Q.reshape(new Shape(seqLen, numHeads, dK)).transpose(1, 0, 2); // [numHeads, seqLen, dK]
-                NDArray K_split = K.reshape(new Shape(seqLen, numHeads, dK)).transpose(1, 0, 2); // [numHeads, seqLen, dK]
-                NDArray V_split = V.reshape(new Shape(seqLen, numHeads, dV)).transpose(1, 0, 2); // [numHeads, seqLen, dV]
+                    NDArray W_Q = manager.randomNormal(0.0f, stddevK, new Shape(dModel, dModel), DataType.FLOAT32);
+                    W_Q.setRequiresGradient(true);
+                    NDArray W_K = manager.randomNormal(0.0f, stddevK, new Shape(dModel, dModel), DataType.FLOAT32);
+                    W_K.setRequiresGradient(true);
+                    NDArray W_V = manager.randomNormal(0.0f, stddevK, new Shape(dModel, dModel), DataType.FLOAT32);
+                    W_V.setRequiresGradient(true);
+                    NDArray W_O = manager.randomNormal(0.0f, stddevO, new Shape(dModel, dModel), DataType.FLOAT32);
+                    W_O.setRequiresGradient(true);
 
-                // Apply Rotary Position Embeddings (RoPE)
-                NDArray Q_rope = applyRoPE(manager, Q_split); // [numHeads, seqLen, dK]
-                NDArray K_rope = applyRoPE(manager, K_split); // [numHeads, seqLen, dK]
+                    trainableParameters.add(W_Q);
+                    trainableParameters.add(W_K);
+                    trainableParameters.add(W_V);
+                    trainableParameters.add(W_O);
 
-                // Transpose last two dimensions explicitly: [numHeads, seqLen, dK] -> [numHeads, dK, seqLen]
-                NDArray K_transposed = K_rope.transpose(0, 2, 1); 
+                    NDArray Q = norm1.matMul(W_Q);
+                    NDArray K = norm1.matMul(W_K);
+                    NDArray V = norm1.matMul(W_V);
 
-                // Raw Scaled Dot-Product Scores: [numHeads, seqLen, dK] x [numHeads, dK, seqLen] -> [numHeads, seqLen, seqLen]
-                NDArray rawScores = Q_rope.matMul(K_transposed).div(Math.sqrt(dK));
+                    NDArray Q_split = Q.reshape(new Shape(seqLen, numHeads, dK)).transpose(1, 0, 2);
+                    NDArray K_split = K.reshape(new Shape(seqLen, numHeads, dK)).transpose(1, 0, 2);
+                    NDArray V_split = V.reshape(new Shape(seqLen, numHeads, dV)).transpose(1, 0, 2);
 
-                // Additive Causal Mask Injection: [numHeads, seqLen, seqLen] + [seqLen, seqLen]
-                NDArray maskedScores = rawScores.add(causalMask);
-                NDArray attentionWeights = maskedScores.softmax(-1);
+                    // Apply Rotary Position Embeddings (RoPE) to Q and K head representations
+                    NDArray Q_rope = applyRoPE(manager, Q_split);
+                    NDArray K_rope = applyRoPE(manager, K_split);
 
-                NDArray headOutputs = attentionWeights.matMul(V_split); // [numHeads, seqLen, dV]
-                NDArray concatOutputs = headOutputs.transpose(1, 0, 2).reshape(new Shape(seqLen, dModel));
-                NDArray mhaOutput = concatOutputs.matMul(W_O);
+                    NDArray K_transposed = K_rope.transpose(0, 2, 1);
+                    NDArray rawScores = Q_rope.matMul(K_transposed).div(Math.sqrt(dK));
 
-                explainLayerMHAStep(tokens, l, numHeads, dModel, dK, Q, K, V, Q_split, attentionWeights, mhaOutput, targetBank1);
+                    // Additive Causal Mask Injection
+                    NDArray maskedScores = rawScores.add(causalMask);
+                    NDArray attentionWeights = maskedScores.softmax(-1);
 
-                // --- SubLayer 1: Pre-LN Residual Highway ---
-                NDArray subLayer1Output = currentX.add(mhaOutput);
+                    NDArray headOutputs = attentionWeights.matMul(V_split);
+                    NDArray concatOutputs = headOutputs.transpose(1, 0, 2).reshape(new Shape(seqLen, dModel));
+                    NDArray mhaOutput = concatOutputs.matMul(W_O);
 
-                explainLayerSubLayer1AddNorm(tokens, l, currentX, mhaOutput, subLayer1Output, subLayer1Output);
+                    explainLayerMHAStep(tokens, l, numHeads, dModel, dK, Q, K, V, Q_split, attentionWeights, mhaOutput, targetBank1);
 
-                // --- SubLayer 2: Pre-LN + SwiGLU Feed-Forward Network ---
-                NDArray norm2 = applyLayerNorm(manager, subLayer1Output, eps);
+                    // --- SubLayer 1: Pre-LN Residual Highway ---
+                    NDArray subLayer1Output = currentX.add(mhaOutput);
 
-                float stddev1 = (float) Math.sqrt(2.0 / (dModel + dFF));
-                float stddev2 = (float) Math.sqrt(2.0 / (dFF + dModel));
+                    explainLayerSubLayer1AddNorm(tokens, l, currentX, mhaOutput, subLayer1Output, subLayer1Output);
 
-                NDArray W_gate = manager.randomNormal(0.0f, stddev1, new Shape(dModel, dFF), DataType.FLOAT32);
-                NDArray b_gate = manager.zeros(new Shape(dFF), DataType.FLOAT32);
-                NDArray W_1 = manager.randomNormal(0.0f, stddev1, new Shape(dModel, dFF), DataType.FLOAT32);
-                NDArray b_1 = manager.zeros(new Shape(dFF), DataType.FLOAT32);
-                NDArray W_2 = manager.randomNormal(0.0f, stddev2, new Shape(dFF, dModel), DataType.FLOAT32);
-                NDArray b_2 = manager.zeros(new Shape(dModel), DataType.FLOAT32);
+                    // --- SubLayer 2: Pre-LN + SwiGLU Feed-Forward Network ---
+                    NDArray norm2 = normLayer2.forward(subLayer1Output);
 
-                // SwiGLU: Swish(X * W_g + b_g) * (X * W_1 + b_1) * W_2 + b_2
-                NDArray gateLinear = norm2.matMul(W_gate).add(b_gate);
-                NDArray gateSwish = applySwish(gateLinear);
-                NDArray featureLinear = norm2.matMul(W_1).add(b_1);
-                NDArray ffnHidden = gateSwish.mul(featureLinear);
-                NDArray ffnOutput = ffnHidden.matMul(W_2).add(b_2);
+                    float stddev1 = (float) Math.sqrt(2.0 / (dModel + dFF));
+                    float stddev2 = (float) Math.sqrt(2.0 / (dFF + dModel));
 
-                explainLayerFFNStep(tokens, l, dModel, dFF, ffnHidden, ffnOutput);
+                    NDArray W_gate = manager.randomNormal(0.0f, stddev1, new Shape(dModel, dFF), DataType.FLOAT32);
+                    W_gate.setRequiresGradient(true);
+                    NDArray b_gate = manager.zeros(new Shape(dFF), DataType.FLOAT32);
+                    b_gate.setRequiresGradient(true);
+                    NDArray W_1 = manager.randomNormal(0.0f, stddev1, new Shape(dModel, dFF), DataType.FLOAT32);
+                    W_1.setRequiresGradient(true);
+                    NDArray b_1 = manager.zeros(new Shape(dFF), DataType.FLOAT32);
+                    b_1.setRequiresGradient(true);
+                    NDArray W_2 = manager.randomNormal(0.0f, stddev2, new Shape(dFF, dModel), DataType.FLOAT32);
+                    W_2.setRequiresGradient(true);
+                    NDArray b_2 = manager.zeros(new Shape(dModel), DataType.FLOAT32);
+                    b_2.setRequiresGradient(true);
 
-                // --- SubLayer 2: Pre-LN Final Residual Addition ---
-                NDArray layerOutput = subLayer1Output.add(ffnOutput);
+                    trainableParameters.add(W_gate);
+                    trainableParameters.add(b_gate);
+                    trainableParameters.add(W_1);
+                    trainableParameters.add(b_1);
+                    trainableParameters.add(W_2);
+                    trainableParameters.add(b_2);
 
-                double cosSimPrev = computeCosineSimilarity(currentX.get((long) targetBank1), layerOutput.get((long) targetBank1));
-                explainLayerSubLayer2AddNorm(tokens, l, currentX, subLayer1Output, ffnOutput, layerOutput, cosSimPrev, targetBank1);
+                    // SwiGLU: Swish(X * W_g + b_g) * (X * W_1 + b_1) * W_2 + b_2
+                    NDArray gateLinear = norm2.matMul(W_gate).add(b_gate);
+                    NDArray gateSwish = applySwish(gateLinear);
+                    NDArray featureLinear = norm2.matMul(W_1).add(b_1);
+                    NDArray ffnHidden = gateSwish.mul(featureLinear);
+                    NDArray ffnOutput = ffnHidden.matMul(W_2).add(b_2);
 
-                // Update input tensor state for the next layer in the stack
-                currentX = layerOutput;
-                saveTrajectorySlice(currentX, bank1Trajectory, l, targetBank1);
-                saveTrajectorySlice(currentX, bank2Trajectory, l, targetBank2);
+                    explainLayerFFNStep(tokens, l, dModel, dFF, ffnHidden, ffnOutput);
+
+                    // --- SubLayer 2: Pre-LN Final Residual Addition ---
+                    NDArray layerOutput = subLayer1Output.add(ffnOutput);
+
+                    double cosSimPrev = computeCosineSimilarity(currentX.get((long) targetBank1), layerOutput.get((long) targetBank1));
+                    explainLayerSubLayer2AddNorm(tokens, l, currentX, subLayer1Output, ffnOutput, layerOutput, cosSimPrev, targetBank1);
+
+                    // Update input tensor state for the next layer in the stack
+                    currentX = layerOutput;
+                    saveTrajectorySlice(currentX, bank1Trajectory, l, targetBank1);
+                    saveTrajectorySlice(currentX, bank2Trajectory, l, targetBank2);
+                }
             }
 
             // =========================================================================
@@ -172,23 +211,6 @@ public class ModernizedHierarchicalEncoderPipeline {
     // LAYER NORMALIZATION, SWISH, AND ROTARY POSITION EMBEDDING HELPERS
     // =========================================================================
 
-    public static NDArray applyLayerNorm(NDManager manager, NDArray X, float epsilon) {
-        Shape shape = X.getShape();
-        long dModel = shape.get(1);
-
-        NDArray mean = X.mean(new int[]{-1}, true);
-        NDArray centered = X.sub(mean);
-        NDArray variance = centered.square().mean(new int[]{-1}, true);
-
-        NDArray stdDev = variance.add(epsilon).sqrt();
-        NDArray normalized = centered.div(stdDev);
-
-        NDArray gamma = manager.ones(new Shape(dModel));
-        NDArray beta = manager.zeros(new Shape(dModel));
-
-        return normalized.mul(gamma).add(beta);
-    }
-
     public static NDArray applySwish(NDArray X) {
         // Swish(x) = x * sigmoid(x) = x / (1 + exp(-x))
         NDArray denominator = X.neg().exp().add(1.0f);
@@ -196,7 +218,6 @@ public class ModernizedHierarchicalEncoderPipeline {
     }
 
     public static NDArray applyRoPE(NDManager manager, NDArray splitTensor) {
-        // splitTensor shape: [h, N, d_k]
         Shape shape = splitTensor.getShape();
         int h = (int) shape.get(0);
         int N = (int) shape.get(1);
