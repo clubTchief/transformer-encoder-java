@@ -1,6 +1,7 @@
 package com.example.math;
 
 import ai.djl.ndarray.NDArray;
+import com.transformer.CausalMaskGenerator;
 import ai.djl.ndarray.NDManager;
 import ai.djl.ndarray.types.DataType;
 import ai.djl.ndarray.types.Shape;
@@ -90,13 +91,13 @@ public class MultiHeadAttention {
         NDArray K_T = K.transpose(0, 2, 1);
         NDArray scores = Q.matMul(K_T).div((float) Math.sqrt(headDim));
 
-        // Apply Causal Mask if present
+        // Causal mask must be exactly [seqLen, keySeqLen] (null only for a single query token)
+        CausalMaskGenerator.requireAttentionMask(causalMask, seqLen, keySeqLen);
         if (causalMask != null) {
-            // Mask shape check & alignment
-            if (causalMask.getShape().get(0) == seqLen && causalMask.getShape().get(1) == keySeqLen) {
-                NDArray mask3D = causalMask.expandDims(0);
-                scores = scores.add(mask3D);
+            if (causalMask.getShape().dimension() != 2) {
+                throw new IllegalArgumentException("MultiHeadAttention expects a 2-D mask but got " + causalMask.getShape());
             }
+            scores = scores.add(causalMask.expandDims(0));
         }
 
         // Softmax across key sequence dimension

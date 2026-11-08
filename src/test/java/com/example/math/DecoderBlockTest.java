@@ -1,6 +1,7 @@
 package com.example.math;
 
 import com.decoder.DecoderBlock;
+import com.decoder.DecoderBlockResult;
 import com.transformer.GradientEngine;
 import com.transformer.CausalMaskGenerator;
 import com.encoder.ModernizedHierarchicalEncoderPipeline;
@@ -101,7 +102,8 @@ class DecoderBlockTest {
             inputX.setRequiresGradient(true); // Track gradients for input tensor
 
             try (GradientCollector gc = manager.getEngine().newGradientCollector()) {
-                NDArray output = block.forward(manager, inputX, null);
+                NDArray mask = CausalMaskGenerator.createCausalMask(manager, 12).squeeze(0).squeeze(0);
+                NDArray output = block.forward(manager, inputX, mask);
                 
                 // 2. Reduce output to a scalar for backward pass
                 NDArray loss = output.sum();
@@ -154,5 +156,66 @@ class DecoderBlockTest {
 
         assertArrayEquals(block.forward(x, mask, rope[0], rope[1]).toFloatArray(),
                 block.forward(x, mask, rope[0], rope[1]).toFloatArray(), 1e-6f);
+    }
+
+    // ------------------------------------------------------------------ mask contract
+
+    @Test
+    @DisplayName("A mask that does not match the attention scores is rejected, never silently ignored")
+    void testWrongSizedMaskThrows() {
+        int n = 6, d = 16;
+        DecoderBlock block = new DecoderBlock(manager, d, 2, 32, 1e-5f);
+        NDArray x = manager.randomNormal(0.0f, 1.0f, new Shape(n, d), DataType.FLOAT32);
+        NDArray tooSmall = CausalMaskGenerator.createCausalMask(manager, n - 1).squeeze(0).squeeze(0);
+        NDArray tooBig = CausalMaskGenerator.createCausalMask(manager, n + 1).squeeze(0).squeeze(0);
+
+        IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
+                () -> block.forward(manager, x, tooSmall));
+        assertTrue(e.getMessage().contains("expected [6, 6]"), "message should say what shape was expected: " + e.getMessage());
+        assertThrows(IllegalArgumentException.class, () -> block.forward(manager, x, tooBig));
+    }
+
+    @Test
+    @DisplayName("No mask is rejected when several tokens are processed (it would silently be bidirectional)")
+    void testMissingMaskRejectedForMultipleTokens() {
+        DecoderBlock block = new DecoderBlock(manager, 16, 2, 32, 1e-5f);
+        NDArray x = manager.randomNormal(0.0f, 1.0f, new Shape(4, 16), DataType.FLOAT32);
+        assertThrows(IllegalArgumentException.class, () -> block.forward(manager, x, null));
+    }
+
+    @Test
+    @DisplayName("No mask is fine for a single token, which can only attend to itself")
+    void testMissingMaskAllowedForSingleToken() {
+        DecoderBlock block = new DecoderBlock(manager, 16, 2, 32, 1e-5f);
+        NDArray x = manager.randomNormal(0.0f, 1.0f, new Shape(1, 16), DataType.FLOAT32);
+        assertEquals(new Shape(1, 16), block.forward(manager, x, null).getShape());
+    }
+
+    @Test
+    @DisplayName("Cached decoding step needs a mask of exactly [newTokens, cached + new]")
+    void testCachedStepRequiresExactMask() {
+        int d = 16;
+        DecoderBlock block = new DecoderBlock(manager, d, 2, 32, 1e-5f);
+        NDArray prompt = manager.randomNormal(0.0f, 1.0f, new Shape(3, d), DataType.FLOAT32);
+        NDArray promptMask = CausalMaskGenerator.createCausalMask(manager, 3).squeeze(0).squeeze(0);
+        DecoderBlockResult prefill = block.forwardWithCache(manager, prompt, promptMask, null, null);
+
+        NDArray next = manager.randomNormal(0.0f, 1.0f, new Shape(1, d), DataType.FLOAT32);
+        NDArray wrong = manager.zeros(new Shape(1, 3), DataType.FLOAT32); // forgot to count the new token
+        assertThrows(IllegalArgumentException.class,
+                () -> block.forwardWithCache(manager, next, wrong, prefill.kCache, prefill.vCache));
+
+        NDArray right = CausalMaskGenerator.createCachedMask(manager, 1, 4);
+        DecoderBlockResult step = block.forwardWithCache(manager, next, right, prefill.kCache, prefill.vCache);
+        assertEquals(4L, step.kCache.getShape().get(2), "cache should now hold 3 + 1 positions");
+    }
+
+    @Test
+    @DisplayName("createCachedMask equals the last rows of the full causal mask")
+    void testCachedMaskMatchesLastRowsOfFullMask() {
+        float[] cached = CausalMaskGenerator.createCachedMask(manager, 2, 5).toFloatArray();
+        float[] lastRows = CausalMaskGenerator.createCausalMask(manager, 5).squeeze(0).squeeze(0)
+                .get(new ai.djl.ndarray.index.NDIndex("3:5")).toFloatArray();
+        assertArrayEquals(lastRows, cached);
     }
 }

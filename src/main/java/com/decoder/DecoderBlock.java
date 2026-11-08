@@ -4,6 +4,7 @@ import ai.djl.ndarray.NDArray;
 import ai.djl.ndarray.NDManager;
 import ai.djl.ndarray.types.DataType;
 import ai.djl.ndarray.types.Shape;
+import com.transformer.CausalMaskGenerator;
 import com.transformer.RMSNorm;
 
 import java.util.ArrayList;
@@ -162,42 +163,11 @@ public DecoderBlockResult forwardWithCache(NDManager manager, NDArray inputX, ND
     NDArray scores = qHead.matMul(currentK.transpose(0, 1, 3, 2)).div(Math.sqrt(headDim));
     long totalSeqLen = currentK.getShape().get(2);
 
-    // 5. Causal Mask Alignment for Incremental Step Decoding
+    // 5. Causal mask: must be exactly [seqLen, totalSeqLen] (null is allowed for a single new token).
+    //    Use CausalMaskGenerator.createCachedMask(manager, seqLen, totalSeqLen). A wrong shape throws.
+    CausalMaskGenerator.requireAttentionMask(causalMask, seqLen, totalSeqLen);
     if (causalMask != null) {
-        Shape maskShape = causalMask.getShape();
-        NDArray activeMask = null;
-
-        if (maskShape.dimension() == 4) {
-            long maskQ = maskShape.get(2);
-            long maskK = maskShape.get(3);
-            long qStart = Math.max(0, maskQ - seqLen);
-            long kEnd = Math.min(maskK, totalSeqLen);
-
-            if (qStart < maskQ && kEnd > 0) {
-                String pattern = String.format(":, :, %d:%d, 0:%d", qStart, maskQ, kEnd);
-                activeMask = causalMask.get(new ai.djl.ndarray.index.NDIndex(pattern));
-            }
-        } else if (maskShape.dimension() == 2) {
-            long maskQ = maskShape.get(0);
-            long maskK = maskShape.get(1);
-            long qStart = Math.max(0, maskQ - seqLen);
-            long kEnd = Math.min(maskK, totalSeqLen);
-
-            if (qStart < maskQ && kEnd > 0) {
-                String pattern = String.format("%d:%d, 0:%d", qStart, maskQ, kEnd);
-                activeMask = causalMask.get(new ai.djl.ndarray.index.NDIndex(pattern));
-            }
-        }
-
-        if (activeMask != null) {
-            Shape aShape = activeMask.getShape();
-            long aQ = aShape.get(aShape.dimension() - 2);
-            long aK = aShape.get(aShape.dimension() - 1);
-
-            if (aQ == scores.getShape().get(2) && aK == scores.getShape().get(3)) {
-                scores = scores.add(activeMask);
-            }
-        }
+        scores = scores.add(causalMask);
     }
 
     NDArray attnWeights = scores.softmax(-1);
@@ -234,6 +204,7 @@ public DecoderBlockResult forwardWithCache(NDManager manager, NDArray inputX, ND
 
         NDArray scores = qHead.matMul(kHead.transpose(0, 1, 3, 2)).div(Math.sqrt(headDim));
 
+        CausalMaskGenerator.requireAttentionMask(causalMask, seqLen, seqLen);
         if (causalMask != null) {
             scores = scores.add(causalMask);
         }
