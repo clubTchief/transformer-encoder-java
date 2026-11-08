@@ -7,10 +7,10 @@ import ai.djl.ndarray.NDManager;
 import ai.djl.ndarray.index.NDIndex;
 import ai.djl.ndarray.types.DataType;
 import ai.djl.ndarray.types.Shape;
-import com.example.math.CausalMaskGenerator;
-import com.example.math.DecoderBlock;
-import com.example.math.LayerNorm;
-import com.example.math.ModernizedHierarchicalEncoderPipeline;
+import com.transformer.CausalMaskGenerator;
+import com.decoder.DecoderBlock;
+import com.transformer.LayerNorm;
+import com.encoder.ModernizedHierarchicalEncoderPipeline;
 
 import java.io.IOException;
 import java.io.Reader;

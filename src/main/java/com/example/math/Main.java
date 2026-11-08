@@ -1,5 +1,6 @@
 package com.example.math;
 
+import com.transformer.BilinearProduct;
 import java.util.Scanner;
 
 public class Main {

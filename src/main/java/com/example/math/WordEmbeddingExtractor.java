@@ -1,5 +1,6 @@
 package com.example.math;
 
+import com.transformer.BilinearProduct;
 import ai.djl.inference.Predictor;
 import ai.djl.huggingface.translator.TextEmbeddingTranslatorFactory;
 import ai.djl.repository.zoo.Criteria;
