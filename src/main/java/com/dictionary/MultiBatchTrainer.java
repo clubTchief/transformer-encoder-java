@@ -53,7 +53,8 @@ public class MultiBatchTrainer {
             int dFF = 256;
             float eps = 1e-5f;
 
-            BlockStackLM model = new BlockStackLM(manager, dModel, numHeads, numLayers, dFF, vocab.size(), eps);
+            BlockStackLM model = new BlockStackLM(manager, numLayers, dModel, numHeads, dFF, vocab.size(), eps);
+
             NDArray embeddingTable = manager.randomUniform(-0.1f, 0.1f, new Shape(vocab.size(), dModel), DataType.FLOAT32);
 
             List<NDArray> trainableParams = new ArrayList<>(model.params());
@@ -67,7 +68,8 @@ public class MultiBatchTrainer {
             float[] embedFlat = embeddingTable.toFloatArray();
 
             // Pre-allocate static causal mask (reusable across all batches)
-            NDArray causalMask = CausalMaskGenerator.createCausalMask(manager, seqLen).squeeze(0).squeeze(0);
+            // Keep 4D shape [1, 1, seqLen, seqLen] for broadcast compatibility with multi-head attention scores
+            NDArray causalMask = CausalMaskGenerator.createCausalMask(manager, seqLen);
 
             AdamOptimizer optimizer = new AdamOptimizer(trainableParams, learningRate, 0.9f, 0.999f, 1e-8f);
 

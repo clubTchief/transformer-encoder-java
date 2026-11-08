@@ -77,8 +77,8 @@ class DecoderBlockTest {
         DecoderBlock block = new DecoderBlock(manager, dModel, numHeads, dFF, eps);
         List<NDArray> params = block.params();
 
-        // 2 LayerNorms x 2 params (gamma, beta) + 4 MHA weights + 6 FFN weights/biases = 14 params
-        assertEquals(14, params.size(), "DecoderBlock must export 14 trainable parameters");
+        // 2 LayerNorms x 2 params (gamma, beta) + 4 MHA weights + 7 FFN weights/biases = 15 params
+        assertEquals(15, params.size(), "DecoderBlock must export 15 trainable parameters");
 
         for (int i = 0; i < params.size(); i++) {
             NDArray param = params.get(i);

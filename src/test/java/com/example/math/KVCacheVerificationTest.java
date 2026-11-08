@@ -103,23 +103,33 @@ public class KVCacheVerificationTest {
             int dModel = 16, numHeads = 2, dFF = 64, seqLen = 6, promptLen = 3;
             DecoderBlock block = new DecoderBlock(manager, dModel, numHeads, dFF, 1e-5f);
             NDArray fullX = manager.randomNormal(0.0f, 1.0f, new Shape(seqLen, dModel), DataType.FLOAT32);
-            NDArray dummy = manager.ones(new Shape(seqLen, dModel / numHeads), DataType.FLOAT32); // cos/sin are unused
+            NDArray dummy = manager.ones(new Shape(seqLen, dModel / numHeads), DataType.FLOAT32);
             NDArray fullMask = CausalMaskGenerator.createCausalMask(manager, seqLen).squeeze(0).squeeze(0);
             float[] full = block.forward(fullX, fullMask, dummy, dummy).toFloatArray();
 
-            // 1. Prefill: the whole prompt in one call, building the cache
+            // 1. Prefill: prompt slice (positions 0..3)
             NDArray prompt = fullX.get(new ai.djl.ndarray.index.NDIndex("0:" + promptLen));
+            NDArray promptCos = dummy.get(new ai.djl.ndarray.index.NDIndex("0:" + promptLen));
+            NDArray promptSin = dummy.get(new ai.djl.ndarray.index.NDIndex("0:" + promptLen));
+            
             DecoderBlockResult res = block.forwardWithCache(prompt,
-                    CausalMaskGenerator.createCachedMask(manager, promptLen, promptLen), dummy, dummy, null, null);
+                    CausalMaskGenerator.createCachedMask(manager, promptLen, promptLen),
+                    promptCos, promptSin, null, null);
+
             java.util.List<float[]> rows = new java.util.ArrayList<>();
             float[] prefill = res.output.toFloatArray();
-            for (int i = 0; i < promptLen; i++) rows.add(java.util.Arrays.copyOfRange(prefill, i * dModel, (i + 1) * dModel));
+            for (int i = 0; i < promptLen; i++) {
+                rows.add(java.util.Arrays.copyOfRange(prefill, i * dModel, (i + 1) * dModel));
+            }
 
-            // 2. Decode the remaining tokens one at a time
+            // 2. Decode: single step slices (position t..t+1)
             for (int t = promptLen; t < seqLen; t++) {
                 NDArray x = fullX.get(new ai.djl.ndarray.index.NDIndex(t + ":" + (t + 1)));
+                NDArray stepCos = dummy.get(new ai.djl.ndarray.index.NDIndex(t + ":" + (t + 1)));
+                NDArray stepSin = dummy.get(new ai.djl.ndarray.index.NDIndex(t + ":" + (t + 1)));
+
                 res = block.forwardWithCache(x, CausalMaskGenerator.createCachedMask(manager, 1, t + 1),
-                        dummy, dummy, res.kCache, res.vCache);
+                        stepCos, stepSin, res.kCache, res.vCache);
                 rows.add(res.output.toFloatArray());
             }
 

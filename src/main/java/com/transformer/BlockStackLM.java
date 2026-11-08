@@ -11,105 +11,114 @@ import java.util.List;
 
 public class BlockStackLM {
 
+    private final int numLayers;
     private final int dModel;
     private final int numHeads;
-    private final int numLayers;
-    private final int dFF;
+    private final int headDim;
     private final int vocabSize;
-    private final float eps;
-
     private final List<DecoderBlock> layers;
     private final RMSNorm finalNorm;
-    private final NDArray lmHead; // Output vocabulary projection matrix [dModel, vocabSize]
+    private final NDArray lmHead; // Linear projection: [dModel, vocabSize]
 
-    public BlockStackLM(NDManager manager, int dModel, int numHeads, int numLayers, int dFF, int vocabSize, float eps) {
+    public BlockStackLM(NDManager manager, int numLayers, int dModel, int numHeads, int dFF, int vocabSize, float eps) {
+        this.numLayers = numLayers;
         this.dModel = dModel;
         this.numHeads = numHeads;
-        this.numLayers = numLayers;
-        this.dFF = dFF;
+        this.headDim = dModel / numHeads;
         this.vocabSize = vocabSize;
-        this.eps = eps;
 
-        this.layers = new ArrayList<>();
+        this.layers = new ArrayList<>(numLayers);
         for (int i = 0; i < numLayers; i++) {
             layers.add(new DecoderBlock(manager, dModel, numHeads, dFF, eps));
         }
 
         this.finalNorm = new RMSNorm(manager, dModel, eps);
-
+        
         float scale = (float) Math.sqrt(2.0 / dModel);
         this.lmHead = manager.randomUniform(-scale, scale, new Shape(dModel, vocabSize), DataType.FLOAT32);
-
-        // Ensure all instantiated model parameters enable autograd tracking by default
-        for (NDArray param : params()) {
-            param.setRequiresGradient(true);
-        }
+        this.lmHead.setRequiresGradient(true);
     }
 
     /**
-     * Standard 3-argument forward pass: accepts inputs and passes through all decoder blocks, 
-     * final RMSNorm, and language modeling head projection.
-     *
-     * @param manager    NDManager context for intermediate tensors
-     * @param inputX     Embedded input tensor [batchSize, seqLen, dModel] or [seqLen, dModel]
-     * @param causalMask Causal attention mask tensor
-     * @return Logits projected to vocabulary dimension [batchSize, seqLen, vocabSize]
+     * Initializes pre-allocated KV Cache buffers for all transformer layers.
      */
+    public List<KVCacheBuffer> createLayerBuffers(NDManager manager, int batchSize, int maxSeqLen) {
+        List<KVCacheBuffer> buffers = new ArrayList<>(numLayers);
+        for (int i = 0; i < numLayers; i++) {
+            buffers.add(new KVCacheBuffer(manager, batchSize, numHeads, maxSeqLen, headDim));
+        }
+        return buffers;
+    }
+
+    /**
+     * Full sequence forward pass (non-cached, standard O(N^2) evaluation).
+     */
+    public NDArray forward(NDManager manager, NDArray inputX, NDArray causalMask, NDArray cos, NDArray sin) {
+        NDArray hidden = inputX;
+        for (DecoderBlock layer : layers) {
+            hidden = layer.forward(manager, hidden, causalMask, cos, sin);
+        }
+        NDArray normed = finalNorm.forward(hidden);
+        return normed.matMul(lmHead);
+    }
+
     public NDArray forward(NDManager manager, NDArray inputX, NDArray causalMask) {
-        NDArray x = inputX;
+        return forward(manager, inputX, causalMask, null, null);
+    }
 
-        // Pass through stacked decoder blocks
-        for (DecoderBlock block : layers) {
-            x = block.forward(manager, x, causalMask);
-        }
+    public NDArray forward(NDArray inputX, NDArray causalMask, NDArray cos, NDArray sin) {
+        return forward(inputX.getManager(), inputX, causalMask, cos, sin);
+    }
 
-        // Apply final Pre-LM RMSNorm layer
-        NDArray normX = finalNorm.forward(x);
-
-        // Project hidden state to vocabulary dimension logits
-        return normX.matMul(lmHead);
+    public NDArray forward(NDArray inputX, NDArray causalMask) {
+        return forward(inputX.getManager(), inputX, causalMask, null, null);
     }
 
     /**
-     * Overloaded 4-argument forward pass for API compatibility across test runners and pipelines.
-     */
-    public NDArray forward(NDManager manager, NDArray inputX, NDArray causalMask, NDArray extraArg) {
-        return forward(manager, inputX, causalMask);
-    }
-
-    /**
-     * Collects and exposes all trainable parameters across the stack, final normalization layer, 
-     * and output language modeling head for the optimizer and gradient collector.
+     * Step-by-step or prompt prefill forward pass using static layer-wise KVCacheBuffers.
      *
-     * @return List of all trainable NDArray parameters
+     * @param inputX Hidden states tensor [batchSize, stepSeqLen, dModel] or [stepSeqLen, dModel]
+     * @param causalMask Attention mask tensor
+     * @param cos Positional cosine embeddings
+     * @param sin Positional sine embeddings
+     * @param layerBuffers Pre-allocated KV buffers for each layer
+     * @return Logits tensor over vocabulary [batchSize, stepSeqLen, vocabSize] or [stepSeqLen, vocabSize]
      */
-    public List<NDArray> params() {
-        List<NDArray> allParams = new ArrayList<>();
-
-        // 1. Decoder Stack Parameters (14 parameters per layer: 7 Attention + 4 RMSNorm + 3 SwiGLU)
-        for (DecoderBlock block : layers) {
-            allParams.addAll(block.params());
+    public NDArray forwardWithBuffer(NDManager manager, NDArray inputX, NDArray causalMask,
+                                    NDArray cos, NDArray sin, List<KVCacheBuffer> layerBuffers) {
+        if (layerBuffers.size() != numLayers) {
+            throw new IllegalArgumentException(
+                String.format("Expected %d layer buffers but got %d", numLayers, layerBuffers.size())
+            );
         }
 
-        // 2. Final RMSNorm Layer Parameters (gamma & beta)
-        allParams.addAll(finalNorm.params());
+        NDArray hidden = inputX;
+        for (int i = 0; i < numLayers; i++) {
+            DecoderBlock layer = layers.get(i);
+            KVCacheBuffer buffer = layerBuffers.get(i);
+            hidden = layer.forwardWithBuffer(manager, hidden, causalMask, cos, sin, buffer);
+        }
 
-        // 3. Language Model Output Head Projection Weight
-        allParams.add(lmHead);
-
-        return allParams;
+        NDArray normed = finalNorm.forward(hidden);
+        return normed.matMul(lmHead);
     }
 
-    public int getDModel() {
-        return dModel;
-    }
-
-    public int getNumHeads() {
-        return numHeads;
+    public List<NDArray> params() {
+        List<NDArray> params = new ArrayList<>();
+        for (DecoderBlock layer : layers) {
+            params.addAll(layer.params());
+        }
+        params.addAll(finalNorm.params());
+        params.add(lmHead);
+        return params;
     }
 
     public int getNumLayers() {
         return numLayers;
+    }
+
+    public int getDModel() {
+        return dModel;
     }
 
     public int getVocabSize() {
