@@ -82,7 +82,13 @@ public class DecoderBlock {
         return x1.add(ffnOut);
     }
 
-    public DecoderBlockResult forwardWithCache(NDArray inputX, NDArray causalMask, NDArray pastK, NDArray pastV, NDArray arg5, NDArray arg6) {
+    /**
+     * Original API order: (x, mask, cos, sin, kCache, vCache). cos/sin are accepted for compatibility but are
+     * currently unused because this block applies no RoPE. (This overload used to read its 3rd/4th arguments
+     * as the caches and drop the real ones, so callers silently got a bogus "past" built from cos/sin.)
+     */
+    public DecoderBlockResult forwardWithCache(NDArray inputX, NDArray causalMask, NDArray cos, NDArray sin,
+                                               NDArray pastK, NDArray pastV) {
         return forwardWithCache(inputX.getManager(), inputX, causalMask, pastK, pastV);
     }
 
@@ -110,54 +116,13 @@ public DecoderBlockResult forwardWithCache(NDManager manager, NDArray inputX, ND
     NDArray kHead = k.reshape(new Shape(batchSize, seqLen, numHeads, headDim)).transpose(0, 2, 1, 3);
     NDArray vHead = v.reshape(new Shape(batchSize, seqLen, numHeads, headDim)).transpose(0, 2, 1, 3);
 
-    // 2. Safe Past Key Cache Formatting and Concatenation
-    NDArray currentK;
-    if (pastK != null) {
-        NDArray formattedPastK = pastK;
-        if (pastK.getShape().dimension() != 4) {
-            long totalElements = pastK.getShape().size();
-            long fullHeadSize = batchSize * numHeads * headDim;
-
-            if (totalElements >= fullHeadSize) {
-                long pastSeq = totalElements / fullHeadSize;
-                formattedPastK = pastK.reshape(new Shape(batchSize, pastSeq, numHeads, headDim))
-                                      .transpose(0, 2, 1, 3);
-            } else {
-                // Handle flat/single-head past cache seed [batchSize, pastSeq, headDim]
-                long pastSeq = Math.max(1, totalElements / (batchSize * headDim));
-                formattedPastK = pastK.reshape(new Shape(batchSize, pastSeq, 1, headDim))
-                                      .transpose(0, 2, 1, 3)
-                                      .repeat(1, numHeads);
-            }
-        }
-        currentK = formattedPastK.concat(kHead, 2);
-    } else {
-        currentK = kHead;
+    // 2. Append the new keys/values to the cache. Caches must be [batch, numHeads, pastLen, headDim];
+    //    anything else is a caller bug and is rejected instead of being reshaped into something plausible.
+    if ((pastK == null) != (pastV == null)) {
+        throw new IllegalArgumentException("pastK and pastV must either both be null or both be provided");
     }
-
-    // 3. Safe Past Value Cache Formatting and Concatenation
-    NDArray currentV;
-    if (pastV != null) {
-        NDArray formattedPastV = pastV;
-        if (pastV.getShape().dimension() != 4) {
-            long totalElements = pastV.getShape().size();
-            long fullHeadSize = batchSize * numHeads * headDim;
-
-            if (totalElements >= fullHeadSize) {
-                long pastSeq = totalElements / fullHeadSize;
-                formattedPastV = pastV.reshape(new Shape(batchSize, pastSeq, numHeads, headDim))
-                                      .transpose(0, 2, 1, 3);
-            } else {
-                long pastSeq = Math.max(1, totalElements / (batchSize * headDim));
-                formattedPastV = pastV.reshape(new Shape(batchSize, pastSeq, 1, headDim))
-                                      .transpose(0, 2, 1, 3)
-                                      .repeat(1, numHeads);
-            }
-        }
-        currentV = formattedPastV.concat(vHead, 2);
-    } else {
-        currentV = vHead;
-    }
+    NDArray currentK = appendToCache(pastK, kHead, "K", batchSize);
+    NDArray currentV = appendToCache(pastV, vHead, "V", batchSize);
 
     // 4. Scaled Dot-Product Attention over dynamic sequence length
     NDArray scores = qHead.matMul(currentK.transpose(0, 1, 3, 2)).div(Math.sqrt(headDim));
@@ -186,6 +151,19 @@ public DecoderBlockResult forwardWithCache(NDManager manager, NDArray inputX, ND
 
     return new DecoderBlockResult(finalOut, currentK, currentV);
 }
+
+    private NDArray appendToCache(NDArray past, NDArray fresh, String name, long batchSize) {
+        if (past == null) {
+            return fresh;
+        }
+        Shape s = past.getShape();
+        if (s.dimension() != 4 || s.get(0) != batchSize || s.get(1) != numHeads || s.get(3) != headDim) {
+            throw new IllegalArgumentException(name + " cache must have shape [" + batchSize + ", " + numHeads
+                    + ", pastLen, " + headDim + "] but was " + s
+                    + ". Pass the kCache/vCache returned by the previous forwardWithCache call (not cos/sin).");
+        }
+        return past.concat(fresh, 2);
+    }
 
     private NDArray selfAttention(NDManager manager, NDArray x, NDArray causalMask) {
         Shape shape = x.getShape();

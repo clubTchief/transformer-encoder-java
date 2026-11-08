@@ -218,4 +218,19 @@ class DecoderBlockTest {
                 .get(new ai.djl.ndarray.index.NDIndex("3:5")).toFloatArray();
         assertArrayEquals(lastRows, cached);
     }
+
+    @Test
+    @DisplayName("Passing cos/sin where the KV caches belong is rejected (the old overload silently accepted it)")
+    void testCosSinAsCacheIsRejected() {
+        int d = 16;
+        DecoderBlock block = new DecoderBlock(manager, d, 2, 32, 1e-5f);
+        NDArray x = manager.randomNormal(0.0f, 1.0f, new Shape(1, d), DataType.FLOAT32);
+        NDArray notACache = manager.ones(new Shape(1, d / 2), DataType.FLOAT32);
+
+        assertThrows(IllegalArgumentException.class,
+                () -> block.forwardWithCache(manager, x, null, notACache, notACache));
+        // only one of the two caches provided
+        assertThrows(IllegalArgumentException.class,
+                () -> block.forwardWithCache(manager, x, null, null, notACache));
+    }
 }

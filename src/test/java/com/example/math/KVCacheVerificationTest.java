@@ -47,6 +47,7 @@ public class KVCacheVerificationTest {
             NDArray kCache = null;
             NDArray vCache = null;
             NDArray cachedLastOutput = null;
+            java.util.List<float[]> stepOutputs = new java.util.ArrayList<>();
 
             System.out.println("\nStep 2: Simulating incremental step-by-step KV-Cached inference...");
 
@@ -55,7 +56,7 @@ public class KVCacheVerificationTest {
                 NDArray stepCos = cos.get(new ai.djl.ndarray.index.NDIndex("{}:{}", t, t + 1));
                 NDArray stepSin = sin.get(new ai.djl.ndarray.index.NDIndex("{}:{}", t, t + 1));
 
-                NDArray stepMask = manager.zeros(new Shape(1, t + 1), DataType.FLOAT32);
+                NDArray stepMask = CausalMaskGenerator.createCachedMask(manager, 1, t + 1);
 
                 DecoderBlockResult res = block.forwardWithCache(
                         singleTokenX, stepMask, stepCos, stepSin, kCache, vCache
@@ -64,6 +65,7 @@ public class KVCacheVerificationTest {
                 kCache = res.kCache;
                 vCache = res.vCache;
                 cachedLastOutput = res.output;
+                stepOutputs.add(res.output.toFloatArray());
 
                 System.out.printf("  [Step %d/%d] Token processed | K-Cache shape: %s | V-Cache shape: %s\n",
                         t + 1, seqLen, kCache.getShape(), vCache.getShape());
@@ -82,9 +84,49 @@ public class KVCacheVerificationTest {
 
             Assertions.assertArrayEquals(expected, actual, 1e-4f, "KV-Cache logits differ from full calculation!");
 
+            // Every position must match, not just the last one
+            float[] fullAll = fullOutput.toFloatArray();
+            for (int pos = 0; pos < seqLen; pos++) {
+                float[] row = java.util.Arrays.copyOfRange(fullAll, pos * dModel, (pos + 1) * dModel);
+                Assertions.assertArrayEquals(row, stepOutputs.get(pos), 1e-4f, "Cached step " + pos + " differs from full pass");
+            }
+
             System.out.println("--------------------------------------------------------------------------------");
             System.out.println("SUCCESS: KV-Cache output matches full O(N^2) pass within 1e-4 tolerance.");
             System.out.println("================================================================================\n");
+        }
+    }
+
+    @Test
+    public void testPrefillThenStepsMatchesFullPass() {
+        try (NDManager manager = NDManager.newBaseManager()) {
+            int dModel = 16, numHeads = 2, dFF = 64, seqLen = 6, promptLen = 3;
+            DecoderBlock block = new DecoderBlock(manager, dModel, numHeads, dFF, 1e-5f);
+            NDArray fullX = manager.randomNormal(0.0f, 1.0f, new Shape(seqLen, dModel), DataType.FLOAT32);
+            NDArray dummy = manager.ones(new Shape(seqLen, dModel / numHeads), DataType.FLOAT32); // cos/sin are unused
+            NDArray fullMask = CausalMaskGenerator.createCausalMask(manager, seqLen).squeeze(0).squeeze(0);
+            float[] full = block.forward(fullX, fullMask, dummy, dummy).toFloatArray();
+
+            // 1. Prefill: the whole prompt in one call, building the cache
+            NDArray prompt = fullX.get(new ai.djl.ndarray.index.NDIndex("0:" + promptLen));
+            DecoderBlockResult res = block.forwardWithCache(prompt,
+                    CausalMaskGenerator.createCachedMask(manager, promptLen, promptLen), dummy, dummy, null, null);
+            java.util.List<float[]> rows = new java.util.ArrayList<>();
+            float[] prefill = res.output.toFloatArray();
+            for (int i = 0; i < promptLen; i++) rows.add(java.util.Arrays.copyOfRange(prefill, i * dModel, (i + 1) * dModel));
+
+            // 2. Decode the remaining tokens one at a time
+            for (int t = promptLen; t < seqLen; t++) {
+                NDArray x = fullX.get(new ai.djl.ndarray.index.NDIndex(t + ":" + (t + 1)));
+                res = block.forwardWithCache(x, CausalMaskGenerator.createCachedMask(manager, 1, t + 1),
+                        dummy, dummy, res.kCache, res.vCache);
+                rows.add(res.output.toFloatArray());
+            }
+
+            for (int pos = 0; pos < seqLen; pos++) {
+                float[] expected = java.util.Arrays.copyOfRange(full, pos * dModel, (pos + 1) * dModel);
+                Assertions.assertArrayEquals(expected, rows.get(pos), 1e-4f, "position " + pos);
+            }
         }
     }
 }
