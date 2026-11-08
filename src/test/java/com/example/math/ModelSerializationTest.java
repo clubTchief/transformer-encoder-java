@@ -7,6 +7,7 @@ import ai.djl.ndarray.types.DataType;
 import ai.djl.ndarray.types.Shape;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
+import com.transformer.BlockStackLM;
 
 import java.io.File;
 import java.io.IOException;

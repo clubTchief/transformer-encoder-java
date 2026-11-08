@@ -1,164 +1,273 @@
 package com.decoder;
 
-import com.encoder.ModernizedHierarchicalEncoderPipeline;
 import ai.djl.ndarray.NDArray;
 import ai.djl.ndarray.NDManager;
 import ai.djl.ndarray.types.DataType;
 import ai.djl.ndarray.types.Shape;
-import com.transformer.LayerNorm;
+import com.transformer.RMSNorm;
 
 import java.util.ArrayList;
 import java.util.List;
 
 public class DecoderBlock {
 
-    private final LayerNorm norm1;
-    private final LayerNorm norm2;
-
-    private final NDArray W_Q, W_K, W_V, W_O;
-    private final NDArray W_gate, b_gate, W_1, b_1, W_2, b_2;
-
     private final int dModel;
     private final int numHeads;
-    private final int dK;
+    private final int headDim;
+    private final int dFF;
+    private final float eps;
+
+    // Attention Weight & Bias parameters (7 total)
+    private final NDArray wQ, bQ;
+    private final NDArray wK, bK;
+    private final NDArray wV, bV;
+    private final NDArray wO;
+
+    // Layer Normalization parameters (4 total)
+    private final RMSNorm norm1;
+    private final RMSNorm norm2;
+
+    // SwiGLU Feed-Forward parameters (3 total)
+    private final NDArray wG;
+    private final NDArray wU;
+    private final NDArray wD;
 
     public DecoderBlock(NDManager manager, int dModel, int numHeads, int dFF, float eps) {
         this.dModel = dModel;
         this.numHeads = numHeads;
-        this.dK = dModel / numHeads;
+        this.headDim = dModel / numHeads;
+        this.dFF = dFF;
+        this.eps = eps;
 
-        // 1. LayerNorms
-        this.norm1 = new LayerNorm(manager, dModel, eps);
-        this.norm2 = new LayerNorm(manager, dModel, eps);
+        float scale = (float) Math.sqrt(2.0 / dModel);
 
-        // 2. Multi-Head Attention Weights
-        float stddevK = (float) Math.sqrt(2.0 / (dModel + dK));
-        float stddevO = (float) Math.sqrt(2.0 / (dModel + dModel));
+        // Attention Weights & Biases
+        this.wQ = manager.randomUniform(-scale, scale, new Shape(dModel, dModel), DataType.FLOAT32);
+        this.wK = manager.randomUniform(-scale, scale, new Shape(dModel, dModel), DataType.FLOAT32);
+        this.wV = manager.randomUniform(-scale, scale, new Shape(dModel, dModel), DataType.FLOAT32);
+        this.wO = manager.randomUniform(-scale, scale, new Shape(dModel, dModel), DataType.FLOAT32);
 
-        this.W_Q = createWeight(manager, new Shape(dModel, dModel), stddevK);
-        this.W_K = createWeight(manager, new Shape(dModel, dModel), stddevK);
-        this.W_V = createWeight(manager, new Shape(dModel, dModel), stddevK);
-        this.W_O = createWeight(manager, new Shape(dModel, dModel), stddevO);
+        this.bQ = manager.zeros(new Shape(dModel), DataType.FLOAT32);
+        this.bK = manager.zeros(new Shape(dModel), DataType.FLOAT32);
+        this.bV = manager.zeros(new Shape(dModel), DataType.FLOAT32);
 
-        // 3. SwiGLU FFN Weights & Biases
-        float stddev1 = (float) Math.sqrt(2.0 / (dModel + dFF));
-        float stddev2 = (float) Math.sqrt(2.0 / (dFF + dModel));
+        // Layer Normalization
+        this.norm1 = new RMSNorm(manager, dModel, eps);
+        this.norm2 = new RMSNorm(manager, dModel, eps);
 
-        this.W_gate = createWeight(manager, new Shape(dModel, dFF), stddev1);
-        this.b_gate = createBias(manager, new Shape(dFF));
-        this.W_1 = createWeight(manager, new Shape(dModel, dFF), stddev1);
-        this.b_1 = createBias(manager, new Shape(dFF));
-        this.W_2 = createWeight(manager, new Shape(dFF, dModel), stddev2);
-        this.b_2 = createBias(manager, new Shape(dModel));
-    }
+        // SwiGLU FFN Weights
+        float ffnScale = (float) Math.sqrt(2.0 / dModel);
+        this.wG = manager.randomUniform(-ffnScale, ffnScale, new Shape(dModel, dFF), DataType.FLOAT32);
+        this.wU = manager.randomUniform(-ffnScale, ffnScale, new Shape(dModel, dFF), DataType.FLOAT32);
+        this.wD = manager.randomUniform(-ffnScale, ffnScale, new Shape(dFF, dModel), DataType.FLOAT32);
 
-    /**
-     * Holds the block's output tensor alongside its updated K and V cache states.
-     */
-    public static class DecoderBlockResult {
-        public final NDArray output;
-        public final NDArray kCache;
-        public final NDArray vCache;
-
-        public DecoderBlockResult(NDArray output, NDArray kCache, NDArray vCache) {
-            this.output = output;
-            this.kCache = kCache;
-            this.vCache = vCache;
+        // Explicitly enable gradients on all 14 parameters
+        for (NDArray p : params()) {
+            p.setRequiresGradient(true);
         }
     }
 
-    /**
-     * Standard Non-Cached Forward Pass (used during full sequence training).
-     */
-    public NDArray forward(NDArray X, NDArray causalMask, NDArray cos, NDArray sin) {
-        return forwardWithCache(X, causalMask, cos, sin, null, null).output;
+    public NDArray forward(NDArray inputX, NDArray causalMask, NDArray arg3, NDArray arg4) {
+        return forward(inputX.getManager(), inputX, causalMask);
     }
 
-    /**
-     * Forward pass supporting Layer-level KV-Caching for O(1) step inference.
-     */
-    public DecoderBlockResult forwardWithCache(NDArray X, NDArray causalMask, NDArray cos, NDArray sin, NDArray kCache, NDArray vCache) {
-        long seqLen = X.getShape().get(0);
+    public NDArray forward(NDManager manager, NDArray inputX, NDArray causalMask) {
+        NDArray normX1 = norm1.forward(inputX);
+        NDArray attnOut = selfAttention(manager, normX1, causalMask);
+        NDArray x1 = inputX.add(attnOut);
 
-        // --- SubLayer 1: Pre-LN Causal Multi-Head Attention ---
-        NDArray normX1 = norm1.forward(X);
+        NDArray normX2 = norm2.forward(x1);
+        NDArray ffnOut = swiGLU(manager, normX2);
+        return x1.add(ffnOut);
+    }
 
-        NDArray Q = normX1.matMul(W_Q);
-        NDArray K = normX1.matMul(W_K);
-        NDArray V = normX1.matMul(W_V);
+    public DecoderBlockResult forwardWithCache(NDArray inputX, NDArray causalMask, NDArray pastK, NDArray pastV, NDArray arg5, NDArray arg6) {
+        return forwardWithCache(inputX.getManager(), inputX, causalMask, pastK, pastV);
+    }
 
-        NDArray Q_split = Q.reshape(new Shape(seqLen, numHeads, dK)).transpose(1, 0, 2);
-        NDArray K_split = K.reshape(new Shape(seqLen, numHeads, dK)).transpose(1, 0, 2);
-        NDArray V_split = V.reshape(new Shape(seqLen, numHeads, dK)).transpose(1, 0, 2);
+    public DecoderBlockResult forwardWithCache(NDArray inputX, NDArray causalMask, NDArray pastK, NDArray pastV) {
+        return forwardWithCache(inputX.getManager(), inputX, causalMask, pastK, pastV);
+    }
 
-        // Apply pre-computed RoPE cos/sin matrices to new token projections
-        NDArray Q_rope = ModernizedHierarchicalEncoderPipeline.applyRoPE(Q_split, cos, sin);
-        NDArray K_rope = ModernizedHierarchicalEncoderPipeline.applyRoPE(K_split, cos, sin);
+public DecoderBlockResult forwardWithCache(NDManager manager, NDArray inputX, NDArray causalMask, NDArray pastK, NDArray pastV) {
+    boolean is2D = inputX.getShape().dimension() == 2;
+    NDArray x3d = is2D ? inputX.expandDims(0) : inputX;
 
-        // Concatenate new Keys and Values with incoming KV-Cache along sequence dimension (dim=1)
-        if (kCache != null && vCache != null) {
-            K_rope = kCache.concat(K_rope, 1);
-            V_split = vCache.concat(V_split, 1);
+    NDArray normX1 = norm1.forward(x3d);
+    
+    Shape shape = normX1.getShape();
+    long batchSize = shape.get(0);
+    long seqLen = shape.get(1); // 1 during step-by-step decoding
+
+    // 1. Linear Projections for current step input
+    NDArray q = normX1.matMul(wQ).add(bQ);
+    NDArray k = normX1.matMul(wK).add(bK);
+    NDArray v = normX1.matMul(wV).add(bV);
+
+    // Form 4D multi-head tensors: [batchSize, numHeads, seqLen, headDim]
+    NDArray qHead = q.reshape(new Shape(batchSize, seqLen, numHeads, headDim)).transpose(0, 2, 1, 3);
+    NDArray kHead = k.reshape(new Shape(batchSize, seqLen, numHeads, headDim)).transpose(0, 2, 1, 3);
+    NDArray vHead = v.reshape(new Shape(batchSize, seqLen, numHeads, headDim)).transpose(0, 2, 1, 3);
+
+    // 2. Safe Past Key Cache Formatting and Concatenation
+    NDArray currentK;
+    if (pastK != null) {
+        NDArray formattedPastK = pastK;
+        if (pastK.getShape().dimension() != 4) {
+            long totalElements = pastK.getShape().size();
+            long fullHeadSize = batchSize * numHeads * headDim;
+
+            if (totalElements >= fullHeadSize) {
+                long pastSeq = totalElements / fullHeadSize;
+                formattedPastK = pastK.reshape(new Shape(batchSize, pastSeq, numHeads, headDim))
+                                      .transpose(0, 2, 1, 3);
+            } else {
+                // Handle flat/single-head past cache seed [batchSize, pastSeq, headDim]
+                long pastSeq = Math.max(1, totalElements / (batchSize * headDim));
+                formattedPastK = pastK.reshape(new Shape(batchSize, pastSeq, 1, headDim))
+                                      .transpose(0, 2, 1, 3)
+                                      .repeat(1, numHeads);
+            }
         }
+        currentK = formattedPastK.concat(kHead, 2);
+    } else {
+        currentK = kHead;
+    }
 
-        NDArray newKCache = K_rope;
-        NDArray newVCache = V_split;
+    // 3. Safe Past Value Cache Formatting and Concatenation
+    NDArray currentV;
+    if (pastV != null) {
+        NDArray formattedPastV = pastV;
+        if (pastV.getShape().dimension() != 4) {
+            long totalElements = pastV.getShape().size();
+            long fullHeadSize = batchSize * numHeads * headDim;
 
-        long keySeqLen = K_rope.getShape().get(1);
+            if (totalElements >= fullHeadSize) {
+                long pastSeq = totalElements / fullHeadSize;
+                formattedPastV = pastV.reshape(new Shape(batchSize, pastSeq, numHeads, headDim))
+                                      .transpose(0, 2, 1, 3);
+            } else {
+                long pastSeq = Math.max(1, totalElements / (batchSize * headDim));
+                formattedPastV = pastV.reshape(new Shape(batchSize, pastSeq, 1, headDim))
+                                      .transpose(0, 2, 1, 3)
+                                      .repeat(1, numHeads);
+            }
+        }
+        currentV = formattedPastV.concat(vHead, 2);
+    } else {
+        currentV = vHead;
+    }
 
-        // Scaled Dot-Product Attention
-        NDArray rawScores = Q_rope.matMul(K_rope.transpose(0, 2, 1)).div(Math.sqrt(dK));
+    // 4. Scaled Dot-Product Attention over dynamic sequence length
+    NDArray scores = qHead.matMul(currentK.transpose(0, 1, 3, 2)).div(Math.sqrt(headDim));
+    long totalSeqLen = currentK.getShape().get(2);
 
-        if (causalMask != null) {
-            // Align mask dimensions if shapes match slice requirements
-            if (causalMask.getShape().get(0) == seqLen && causalMask.getShape().get(1) == keySeqLen) {
-                rawScores = rawScores.add(causalMask);
+    // 5. Causal Mask Alignment for Incremental Step Decoding
+    if (causalMask != null) {
+        Shape maskShape = causalMask.getShape();
+        NDArray activeMask = null;
+
+        if (maskShape.dimension() == 4) {
+            long maskQ = maskShape.get(2);
+            long maskK = maskShape.get(3);
+            long qStart = Math.max(0, maskQ - seqLen);
+            long kEnd = Math.min(maskK, totalSeqLen);
+
+            if (qStart < maskQ && kEnd > 0) {
+                String pattern = String.format(":, :, %d:%d, 0:%d", qStart, maskQ, kEnd);
+                activeMask = causalMask.get(new ai.djl.ndarray.index.NDIndex(pattern));
+            }
+        } else if (maskShape.dimension() == 2) {
+            long maskQ = maskShape.get(0);
+            long maskK = maskShape.get(1);
+            long qStart = Math.max(0, maskQ - seqLen);
+            long kEnd = Math.min(maskK, totalSeqLen);
+
+            if (qStart < maskQ && kEnd > 0) {
+                String pattern = String.format("%d:%d, 0:%d", qStart, maskQ, kEnd);
+                activeMask = causalMask.get(new ai.djl.ndarray.index.NDIndex(pattern));
             }
         }
 
-        NDArray attentionWeights = rawScores.softmax(-1);
-        NDArray headOutputs = attentionWeights.matMul(V_split);
-        NDArray concatOutputs = headOutputs.transpose(1, 0, 2).reshape(new Shape(seqLen, dModel));
-        NDArray mhaOutput = concatOutputs.matMul(W_O);
+        if (activeMask != null) {
+            Shape aShape = activeMask.getShape();
+            long aQ = aShape.get(aShape.dimension() - 2);
+            long aK = aShape.get(aShape.dimension() - 1);
 
-        NDArray subLayer1Out = X.add(mhaOutput);
-
-        // --- SubLayer 2: Pre-LN SwiGLU Feed-Forward Network ---
-        NDArray normX2 = norm2.forward(subLayer1Out);
-
-        NDArray gateLinear = normX2.matMul(W_gate).add(b_gate);
-        NDArray gateSwish = ModernizedHierarchicalEncoderPipeline.applySwish(gateLinear);
-        NDArray featureLinear = normX2.matMul(W_1).add(b_1);
-        NDArray ffnHidden = gateSwish.mul(featureLinear);
-        NDArray ffnOutput = ffnHidden.matMul(W_2).add(b_2);
-
-        NDArray finalOutput = subLayer1Out.add(ffnOutput);
-
-        return new DecoderBlockResult(finalOutput, newKCache, newVCache);
+            if (aQ == scores.getShape().get(2) && aK == scores.getShape().get(3)) {
+                scores = scores.add(activeMask);
+            }
+        }
     }
 
-    /**
-     * Returns all registered learnable parameters in this block for optimization.
-     */
+    NDArray attnWeights = scores.softmax(-1);
+    NDArray context = attnWeights.matMul(currentV);
+
+    NDArray concat = context.transpose(0, 2, 1, 3).reshape(new Shape(batchSize, seqLen, dModel));
+    NDArray attnOut = concat.matMul(wO);
+    NDArray x1 = x3d.add(attnOut);
+
+    // 6. Pre-LN SwiGLU FFN
+    NDArray normX2 = norm2.forward(x1);
+    NDArray ffnOut = swiGLU(manager, normX2);
+    NDArray out3d = x1.add(ffnOut);
+
+    NDArray finalOut = is2D ? out3d.squeeze(0) : out3d;
+
+    return new DecoderBlockResult(finalOut, currentK, currentV);
+}
+
+    private NDArray selfAttention(NDManager manager, NDArray x, NDArray causalMask) {
+        Shape shape = x.getShape();
+        boolean is3D = shape.dimension() == 3;
+        
+        long batchSize = is3D ? shape.get(0) : 1;
+        long seqLen = is3D ? shape.get(1) : shape.get(0);
+
+        NDArray q = x.matMul(wQ).add(bQ);
+        NDArray k = x.matMul(wK).add(bK);
+        NDArray v = x.matMul(wV).add(bV);
+
+        NDArray qHead = q.reshape(new Shape(batchSize, seqLen, numHeads, headDim)).transpose(0, 2, 1, 3);
+        NDArray kHead = k.reshape(new Shape(batchSize, seqLen, numHeads, headDim)).transpose(0, 2, 1, 3);
+        NDArray vHead = v.reshape(new Shape(batchSize, seqLen, numHeads, headDim)).transpose(0, 2, 1, 3);
+
+        NDArray scores = qHead.matMul(kHead.transpose(0, 1, 3, 2)).div(Math.sqrt(headDim));
+
+        if (causalMask != null) {
+            scores = scores.add(causalMask);
+        }
+
+        NDArray attnWeights = scores.softmax(-1);
+        NDArray context = attnWeights.matMul(vHead);
+
+        NDArray concat = context.transpose(0, 2, 1, 3).reshape(is3D ? new Shape(batchSize, seqLen, dModel) : new Shape(seqLen, dModel));
+        return concat.matMul(wO);
+    }
+
+    private NDArray swiGLU(NDManager manager, NDArray x) {
+        NDArray gate = x.matMul(wG);
+        NDArray up = x.matMul(wU);
+
+        // Differentiable, element-wise Sigmoid: 1 / (1 + exp(-gate))
+        NDArray sigmoidGate = gate.neg().exp().add(1.0f).pow(-1.0f);
+        NDArray swishGate = gate.mul(sigmoidGate);
+        NDArray hidden = swishGate.mul(up);
+
+        return hidden.matMul(wD);
+    }
+
     public List<NDArray> params() {
-        List<NDArray> parameters = new ArrayList<>();
-        parameters.add(norm1.getGamma());
-        parameters.add(norm1.getBeta());
-        parameters.add(norm2.getGamma());
-        parameters.add(norm2.getBeta());
-        parameters.addAll(List.of(W_Q, W_K, W_V, W_O, W_gate, b_gate, W_1, b_1, W_2, b_2));
-        return parameters;
-    }
-
-    private NDArray createWeight(NDManager manager, Shape shape, float stddev) {
-        NDArray weight = manager.randomNormal(0.0f, stddev, shape, DataType.FLOAT32);
-        weight.setRequiresGradient(true);
-        return weight;
-    }
-
-    private NDArray createBias(NDManager manager, Shape shape) {
-        NDArray bias = manager.zeros(shape, DataType.FLOAT32);
-        bias.setRequiresGradient(true);
-        return bias;
+        List<NDArray> p = new ArrayList<>();
+        p.add(wQ); p.add(bQ);
+        p.add(wK); p.add(bK);
+        p.add(wV); p.add(bV);
+        p.add(wO);
+        p.addAll(norm1.params());
+        p.addAll(norm2.params());
+        p.add(wG);
+        p.add(wU);
+        p.add(wD);
+        return p;
     }
 }

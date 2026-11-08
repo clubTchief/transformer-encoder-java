@@ -1,74 +1,91 @@
 package com.transformer;
 
-import ai.djl.ndarray.NDArray;
-import ai.djl.ndarray.NDList;
-import ai.djl.ndarray.index.NDIndex;
-
-import java.util.Random;
+import java.util.*;
 
 public class SamplingUtils {
 
-    private static final Random random = new Random();
-
     /**
-     * Takes logits for the last token [vocabSize], applies temperature scaling,
-     * performs Top-K filtering, and samples a single token ID.
+     * Samples the next token ID using Temperature scaling and Top-p (Nucleus) / Top-k filtering.
+     *
+     * @param logits      Raw unnormalized logits array from the model [vocabSize]
+     * @param temperature Controls randomness (T < 1.0 = focused, T > 1.0 = creative)
+     * @param topK        Limits candidate pool to top K highest logits (set <= 0 to disable)
+     * @param topP        Nucleus threshold: cumulative probability cutoff (e.g., 0.9)
+     * @return Selected token ID
      */
-    public static int sampleNextToken(NDArray logits, float temperature, int topK) {
-        // 1. Temperature Scaling
-        NDArray scaledLogits = logits.div(Math.max(temperature, 1e-5f));
-
-        // 2. Top-K Filtering
-        float[] logitsArray = scaledLogits.toFloatArray();
-        int vocabSize = logitsArray.length;
-        topK = Math.min(topK, vocabSize);
-
-        // Find indices of top K values
-        Integer[] indices = new Integer[vocabSize];
-        for (int i = 0; i < vocabSize; i++) indices[i] = i;
-
-        java.util.Arrays.sort(indices, (a, b) -> Float.compare(logitsArray[b], logitsArray[a]));
-
-        // Mask tokens outside Top-K with -infinity
-        float[] filteredLogits = new float[vocabSize];
-        java.util.Arrays.fill(filteredLogits, Float.NEGATIVE_INFINITY);
-        for (int i = 0; i < topK; i++) {
-            int idx = indices[i];
-            filteredLogits[idx] = logitsArray[idx];
+    public static int sampleToken(float[] logits, float temperature, int topK, float topP) {
+        int vocabSize = logits.length;
+        
+        // 1. Apply Temperature Scaling
+        float[] scaledLogits = new float[vocabSize];
+        for (int i = 0; i < vocabSize; i++) {
+            scaledLogits[i] = logits[i] / Math.max(temperature, 1e-5f);
         }
 
-        // 3. Compute Softmax Probabilities over Top-K
-        float maxLogit = Float.NEGATIVE_INFINITY;
-        for (int i = 0; i < topK; i++) {
-            if (filteredLogits[indices[i]] > maxLogit) {
-                maxLogit = filteredLogits[indices[i]];
+        // 2. Pair indices with logits for sorting
+        List<TokenLogit> tokenLogits = new ArrayList<>(vocabSize);
+        for (int i = 0; i < vocabSize; i++) {
+            tokenLogits.add(new TokenLogit(i, scaledLogits[i]));
+        }
+        tokenLogits.sort((a, b) -> Float.compare(b.logit, a.logit));
+
+        // 3. Apply Top-K Truncation
+        if (topK > 0 && topK < tokenLogits.size()) {
+            tokenLogits = tokenLogits.subList(0, topK);
+        }
+
+        // 4. Compute Softmax Probabilities over candidates
+        float maxLogit = tokenLogits.get(0).logit;
+        double sumExp = 0.0;
+        double[] probs = new double[tokenLogits.size()];
+
+        for (int i = 0; i < tokenLogits.size(); i++) {
+            probs[i] = Math.exp(tokenLogits.get(i).logit - maxLogit); // Stable softmax
+            sumExp += probs[i];
+        }
+
+        for (int i = 0; i < probs.length; i++) {
+            probs[i] /= sumExp;
+        }
+
+        // 5. Apply Top-P (Nucleus) Truncation
+        double cumProb = 0.0;
+        int cutoffIndex = probs.length;
+        for (int i = 0; i < probs.length; i++) {
+            cumProb += probs[i];
+            if (cumProb >= topP) {
+                cutoffIndex = i + 1;
+                break;
+            }
+        }
+        
+        // Truncate to nucleus
+        List<TokenLogit> nucleusTokens = tokenLogits.subList(0, cutoffIndex);
+        double nucleusSum = 0.0;
+        for (int i = 0; i < cutoffIndex; i++) {
+            nucleusSum += probs[i];
+        }
+
+        // 6. Stochastic Categorical Sampling
+        double r = Math.random() * nucleusSum;
+        double accum = 0.0;
+        for (int i = 0; i < cutoffIndex; i++) {
+            accum += probs[i];
+            if (accum >= r) {
+                return nucleusTokens.get(i).id;
             }
         }
 
-        float sumExp = 0.0f;
-        float[] probs = new float[vocabSize];
-        for (int i = 0; i < topK; i++) {
-            int idx = indices[i];
-            probs[idx] = (float) Math.exp(filteredLogits[idx] - maxLogit);
-            sumExp += probs[idx];
-        }
+        return nucleusTokens.get(0).id;
+    }
 
-        for (int i = 0; i < topK; i++) {
-            int idx = indices[i];
-            probs[idx] /= sumExp;
-        }
+    private static class TokenLogit {
+        final int id;
+        final float logit;
 
-        // 4. Random Categorical Sampling
-        float r = random.nextFloat();
-        float cumulativeProbability = 0.0f;
-        for (int i = 0; i < topK; i++) {
-            int idx = indices[i];
-            cumulativeProbability += probs[idx];
-            if (r <= cumulativeProbability) {
-                return idx;
-            }
+        TokenLogit(int id, float logit) {
+            this.id = id;
+            this.logit = logit;
         }
-
-        return indices[0]; // Fallback to argmax
     }
 }

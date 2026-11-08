@@ -1,6 +1,7 @@
 package com.example.math;
 
 import com.decoder.DecoderBlock;
+import com.decoder.DecoderBlockResult;
 import com.transformer.CausalMaskGenerator;
 import ai.djl.ndarray.NDArray;
 import ai.djl.ndarray.NDManager;
@@ -56,7 +57,7 @@ public class KVCacheVerificationTest {
 
                 NDArray stepMask = manager.zeros(new Shape(1, t + 1), DataType.FLOAT32);
 
-                DecoderBlock.DecoderBlockResult res = block.forwardWithCache(
+                DecoderBlockResult res = block.forwardWithCache(
                         singleTokenX, stepMask, stepCos, stepSin, kCache, vCache
                 );
 

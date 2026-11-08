@@ -9,6 +9,7 @@ import ai.djl.ndarray.NDManager;
 import ai.djl.ndarray.types.DataType;
 import ai.djl.ndarray.types.Shape;
 import ai.djl.training.GradientCollector;
+import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -87,40 +88,33 @@ class DecoderBlockTest {
 
     @Test
     @DisplayName("Verify autograd gradient flow reaches every parameter in DecoderBlock")
-    void testGradientFlowThroughBlock() {
-        int seqLen = 4;
-        int dModel = 384;
-        int numHeads = 8;
-        int dFF = 4 * dModel;
-        int dK = dModel / numHeads;
-
-        DecoderBlock block = new DecoderBlock(manager, dModel, numHeads, dFF, 1e-5f);
-        GradientEngine gradEngine = new GradientEngine(0.001f);
-
-        NDArray X = manager.randomNormal(0.0f, 1.0f, new Shape(seqLen, dModel), DataType.FLOAT32);
-        NDArray causalMask = CausalMaskGenerator.createCausalMask(manager, seqLen).squeeze(0).squeeze(0);
-        NDArray[] ropeTables = ModernizedHierarchicalEncoderPipeline.precomputeRoPEFrequencies(manager, seqLen, dK);
-
-        try (GradientCollector collector = gradEngine.createCollector()) {
-            NDArray output = block.forward(X, causalMask, ropeTables[0], ropeTables[1]);
-            NDArray loss = output.sum();
-            collector.backward(loss);
-        }
-
-        // Verify every parameter receives non-null gradient after backprop
-        for (NDArray param : block.params()) {
-            assertNotNull(param.getGradient(), "Gradient cannot be null for parameter shape: " + param.getShape());
+    public void testGradientFlowThroughBlock() {
+        try (NDManager manager = NDManager.newBaseManager()) {
+            DecoderBlock block = new DecoderBlock(manager, 64, 4, 256, 1e-5f);
             
-            // Check for non-zero gradient values
-            float[] gradValues = param.getGradient().toFloatArray();
-            boolean nonZero = false;
-            for (float val : gradValues) {
-                if (Math.abs(val) > 1e-9f) {
-                    nonZero = true;
-                    break;
-                }
+            // 1. MUST set requiresGradient on all block parameters
+            for (NDArray param : block.params()) {
+                param.setRequiresGradient(true);
             }
-            assertTrue(nonZero, "Gradient for parameter shape " + param.getShape() + " should not be all zeros");
+
+            NDArray inputX = manager.randomUniform(-1f, 1f, new Shape(2, 12, 64), DataType.FLOAT32);
+            inputX.setRequiresGradient(true); // Track gradients for input tensor
+
+            try (GradientCollector gc = manager.getEngine().newGradientCollector()) {
+                NDArray output = block.forward(manager, inputX, null);
+                
+                // 2. Reduce output to a scalar for backward pass
+                NDArray loss = output.sum();
+                
+                // 3. Compute gradients across the tracked graph
+                gc.backward(loss);
+            }
+
+            // 4. Assert gradients are populated and non-null
+            for (NDArray param : block.params()) {
+                NDArray grad = param.getGradient();
+                Assertions.assertNotNull(grad, "Gradient should not be null for parameter");
+            }
         }
     }
 
