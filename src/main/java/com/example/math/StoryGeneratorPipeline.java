@@ -4,6 +4,7 @@ import ai.djl.ndarray.NDArray;
 import ai.djl.ndarray.NDManager;
 import ai.djl.ndarray.types.DataType;
 import ai.djl.ndarray.types.Shape;
+import com.dictionary.StoryModelSpec;
 import com.dictionary.Vocabulary;
 import com.generation.Sampler;
 import com.generation.TextGenerator;
@@ -17,7 +18,7 @@ import java.util.List;
 public class StoryGeneratorPipeline {
 
     public static void main(String[] args) {
-        String checkpointPath = "models/story_model.bin";
+        String checkpointPath = StoryModelSpec.CHECKPOINT_PATH;
         File modelFile = new File(checkpointPath);
 
         if (!modelFile.exists()) {
@@ -27,27 +28,15 @@ public class StoryGeneratorPipeline {
         }
 
         // Training corpus used to dynamically rebuild identical vocabulary mapping
-        List<String> corpus = Arrays.asList(
-            "Once upon a time in a distant realm lived a brave knight .",
-            "The knight found a mysterious glowing sword inside a dark cave .",
-            "A powerful dragon protected the ancient castle in the realm .",
-            "The brave knight defended the realm and restored peace to all ."
-        );
+        List<String> corpus = StoryModelSpec.CORPUS;
 
         Vocabulary vocab = new Vocabulary(corpus);
         int vocabSize = vocab.size();
 
         try (NDManager manager = NDManager.newBaseManager()) {
 
-            // Model Hyperparameters
-            int dModel = 64;
-            int numHeads = 4;
-            int numLayers = 2;
-            int dFF = 256;
-            float eps = 1e-5f;
-
-            // Instantiate architecture and parameter embeddings
-            BlockStackLM model = new BlockStackLM(manager, new LMConfig(numLayers, dModel, numHeads, dFF, vocabSize, eps));
+            // Sizes come from StoryModelSpec, the same definition the trainer and the CLI use
+            BlockStackLM model = new BlockStackLM(manager, StoryModelSpec.config(vocabSize));
 
             // The embedding table is part of the model, so params() is the whole checkpoint
             List<NDArray> fullTrainableParams = model.params();
@@ -58,6 +47,10 @@ public class StoryGeneratorPipeline {
 
             try {
                 ModelSerializer.loadWeights(manager, checkpointPath, fullTrainableParams);
+            } catch (IllegalArgumentException e) {
+                System.err.println("[ERROR] The checkpoint does not match this model: " + e.getMessage());
+                System.err.println("[ERROR] Retrain with MultiBatchTrainer (checkpoints from older versions do not fit).");
+                return;
             } catch (IOException e) {
                 System.err.println("[ERROR] Failed to load checkpoint weights: " + e.getMessage());
                 return;

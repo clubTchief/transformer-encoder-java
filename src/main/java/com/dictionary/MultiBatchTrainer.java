@@ -24,14 +24,9 @@ public class MultiBatchTrainer {
     public static void main(String[] args) {
         try (NDManager manager = NDManager.newBaseManager()) {
 
-            List<String> corpus = Arrays.asList(
-                "Once upon a time in a distant realm lived a brave knight .",
-                "The knight found a mysterious glowing sword inside a dark cave .",
-                "A powerful dragon protected the ancient castle in the realm .",
-                "The brave knight defended the realm and restored peace to all ."
-            );
+            List<String> corpus = StoryModelSpec.CORPUS;
 
-            int seqLen = 12;
+            int seqLen = StoryModelSpec.SEQ_LEN;
             int batchSize = 2;
             int epochs = 100;
             float learningRate = 0.01f;
@@ -48,13 +43,8 @@ public class MultiBatchTrainer {
             System.out.println("Batch Size     : " + batchSize + " | Batches per Epoch: " + dataset.getNumBatches(batchSize));
             System.out.println("--------------------------------------------------------------------------------");
 
-            int dModel = 64;
-            int numHeads = 4;
-            int numLayers = 2;
-            int dFF = 256;
-            float eps = 1e-5f;
-
-            BlockStackLM model = new BlockStackLM(manager, new LMConfig(numLayers, dModel, numHeads, dFF, vocab.size(), eps));
+            // Sizes come from StoryModelSpec, the same definition the pipeline and the CLI use
+            BlockStackLM model = new BlockStackLM(manager, StoryModelSpec.config(vocab.size()));
 
             // The embedding table lives inside the model (tied with the output head), so it is part of params()
             // and, unlike the former copy through a Java float[], it receives gradients.
@@ -101,7 +91,7 @@ public class MultiBatchTrainer {
                 modelsDir.mkdirs();
             }
 
-            String checkpointPath = "models/story_model.bin";
+            String checkpointPath = StoryModelSpec.CHECKPOINT_PATH;
             ModelSerializer.saveWeights(checkpointPath, trainableParams);
             System.out.println("Successfully serialized trained weights to: " + checkpointPath);
             System.out.println("================================================================================");

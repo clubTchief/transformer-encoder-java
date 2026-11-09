@@ -122,7 +122,7 @@ public class MultiEpochTrainer {
             // ================================================================================
             //            >>> SERIALIZING TRAINED MODEL WEIGHTS <<<
             // ================================================================================
-            String checkpointPath = "models/story_model.bin";
+            String checkpointPath = "models/single_sentence_model.bin"; // its own tiny vocabulary: never share the story checkpoint
             try {
                 ModelSerializer.saveWeights(checkpointPath, fullTrainableParams);
             } catch (IOException e) {
