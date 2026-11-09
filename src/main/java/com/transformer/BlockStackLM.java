@@ -46,7 +46,14 @@ public class BlockStackLM {
      * -> [seqLen, dModel] or [batch, seqLen, dModel]. Differentiable w.r.t. the embedding table.
      */
     public NDArray embed(NDArray tokenIds) {
-        return tokenIds.toType(DataType.INT64, false).oneHot(config.vocabSize()).matMul(embedding);
+        // One-hot on a flat [N] vector (the path every model in this repo uses), then restore the original shape.
+        long[] idDims = tokenIds.getShape().getShape();
+        NDArray flat = tokenIds.reshape(tokenIds.size()).toType(DataType.INT64, false);
+        NDArray vectors = flat.oneHot(config.vocabSize()).matMul(embedding); // [N, dModel]
+
+        long[] outDims = java.util.Arrays.copyOf(idDims, idDims.length + 1);
+        outDims[idDims.length] = config.dModel();
+        return vectors.reshape(outDims);
     }
 
     // ------------------------------------------------------------------ full passes

@@ -22,8 +22,12 @@ public class CausalLossCalculator {
         // 3. Flatten targets to 1D [batchSize * seqLen]
         NDArray flatTargets = targets.reshape(new Shape(batchSize * seqLen));
 
-        // 4. Gather log-probabilities for target indices: shape [batchSize * seqLen]
-        NDArray targetLogProbs = logProbs.gather(flatTargets.toType(DataType.INT64, false), 1);
+        // 4. Log-probability of each target token: shape [batchSize * seqLen].
+        //    (torch.gather needs an index with the same rank as its input, so a 1-D index on this 2-D tensor fails with
+        //    "Index tensor must have the same number of dimensions as input tensor". Selecting with a one-hot mask is
+        //    the same maths, differentiable, and the approach the other trainers in this repo already use.)
+        NDArray targetMask = flatTargets.toType(DataType.INT64, false).oneHot((int) vocabSize); // [N, vocabSize]
+        NDArray targetLogProbs = logProbs.mul(targetMask).sum(new int[]{1});
 
         // 5. Create mask to exclude <PAD> tokens (using neq)
         NDArray nonPadMask = flatTargets.neq(padTokenId).toType(DataType.FLOAT32, false);
