@@ -14,7 +14,7 @@ import java.util.Scanner;
 /** Interactive story generator: loads the checkpoint written by MultiBatchTrainer and continues what you type. */
 public class StoryGeneratorCLI {
 
-    private static final int MAX_NEW_TOKENS = 15;
+    private static final int MAX_NEW_TOKENS = StoryModelSpec.SEQ_LEN;
     private static final float TEMPERATURE = 0.7f;
     private static final int TOP_K = 3;
     private static final float TOP_P = 0.9f;
@@ -77,7 +77,16 @@ public class StoryGeneratorCLI {
                     continue;
                 }
 
-                List<Integer> generated = generator.generate(manager, prompt.ids(), MAX_NEW_TOKENS, eosTokenId,
+                // The model only saw positions 0..SEQ_LEN during training; further out its positions are untrained and the
+                // text derails. The prompt (BOS included) plus the continuation therefore has to fit in SEQ_LEN + 1 tokens.
+                int maxNew = Math.min(MAX_NEW_TOKENS, StoryModelSpec.SEQ_LEN + 1 - prompt.ids().length);
+                if (maxNew < 1) {
+                    System.out.println("That prompt is longer than the " + StoryModelSpec.SEQ_LEN
+                            + " words the model was trained on. Please shorten it.");
+                    continue;
+                }
+
+                List<Integer> generated = generator.generate(manager, prompt.ids(), maxNew, eosTokenId,
                         TEMPERATURE, TOP_K, TOP_P, REPETITION_PENALTY);
 
                 List<Integer> promptIds = java.util.Arrays.stream(prompt.ids()).boxed().toList();

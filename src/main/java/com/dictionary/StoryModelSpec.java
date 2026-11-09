@@ -17,7 +17,12 @@ public final class StoryModelSpec {
             "The brave knight defended the realm and restored peace to all ."
     );
 
-    public static final int SEQ_LEN = 12;
+    /**
+     * Training window. It must be at least as long as the longest sentence (BOS + words + EOS - 1 = 14 here), otherwise
+     * StoryDataset cuts the sentence into separate chunks and the tail ("." and EOS) is learned without any context,
+     * so the model never learns to END a sentence after its words. StoryModelSpecTest guards this.
+     */
+    public static final int SEQ_LEN = 14;
     public static final int D_MODEL = 64;
     public static final int NUM_HEADS = 4;
     public static final int NUM_LAYERS = 2;
