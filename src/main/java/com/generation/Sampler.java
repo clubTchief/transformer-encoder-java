@@ -29,16 +29,22 @@ public class Sampler {
         NDArray probs = logits.softmax(-1);
         float[] probArray = probs.toFloatArray();
 
-        float r = random.nextFloat();
+        float r = random.nextFloat(); // [0, 1)
         float cumulativeProb = 0.0f;
+        int lastPossible = -1;
 
         for (int i = 0; i < probArray.length; i++) {
+            if (probArray[i] <= 0.0f) {
+                continue; // filtered by top-k/top-p: can never be picked
+            }
+            lastPossible = i;
             cumulativeProb += probArray[i];
-            if (r <= cumulativeProb) {
+            if (r < cumulativeProb) {
                 return i;
             }
         }
 
-        return probArray.length - 1;
+        // Rounding left the cumulative sum just below r: fall back to the last token that had any probability
+        return lastPossible >= 0 ? lastPossible : probArray.length - 1;
     }
 }

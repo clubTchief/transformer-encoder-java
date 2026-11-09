@@ -8,6 +8,7 @@ import ai.djl.ndarray.index.NDIndex;
 import ai.djl.ndarray.types.DataType;
 import ai.djl.ndarray.types.Shape;
 import com.transformer.CausalMaskGenerator;
+import com.transformer.RopeEmbeddings;
 import com.decoder.DecoderBlock;
 import com.transformer.LayerNorm;
 import com.encoder.ModernizedHierarchicalEncoderPipeline;
@@ -68,7 +69,7 @@ public final class BlockStackLM {
             throw new IllegalArgumentException("T=" + T + " exceeds context length " + cfg.contextLength());
         }
         NDArray mask = CausalMaskGenerator.createCausalMask(scope, T).squeeze(0).squeeze(0);
-        NDArray[] rope = ModernizedHierarchicalEncoderPipeline.precomputeRoPEFrequencies(scope, T, cfg.headDim());
+        NDArray[] rope = RopeEmbeddings.computeCosSin(scope, (int) T, cfg.headDim());
         NDArray embT = tokEmb.transpose();
         embT.attach(scope);
 

@@ -7,6 +7,7 @@ import ai.djl.ndarray.types.Shape;
 import ai.djl.training.GradientCollector;
 import com.transformer.RMSNorm;
 import com.transformer.BlockStackLM;
+import com.transformer.LMConfig;
 import com.transformer.CausalLossCalculator;
 import com.transformer.CausalMaskGenerator;
 import com.transformer.AdamOptimizer;
@@ -53,19 +54,11 @@ public class MultiBatchTrainer {
             int dFF = 256;
             float eps = 1e-5f;
 
-            BlockStackLM model = new BlockStackLM(manager, numLayers, dModel, numHeads, dFF, vocab.size(), eps);
+            BlockStackLM model = new BlockStackLM(manager, new LMConfig(numLayers, dModel, numHeads, dFF, vocab.size(), eps));
 
-            NDArray embeddingTable = manager.randomUniform(-0.1f, 0.1f, new Shape(vocab.size(), dModel), DataType.FLOAT32);
-
-            List<NDArray> trainableParams = new ArrayList<>(model.params());
-            trainableParams.add(embeddingTable);
-
-            for (NDArray param : trainableParams) {
-                param.setRequiresGradient(true);
-            }
-
-            // Move embedding table data to a Java float array for O(1) host lookup
-            float[] embedFlat = embeddingTable.toFloatArray();
+            // The embedding table lives inside the model (tied with the output head), so it is part of params()
+            // and, unlike the former copy through a Java float[], it receives gradients.
+            List<NDArray> trainableParams = model.params();
 
             // Pre-allocate static causal mask (reusable across all batches)
             // Keep 4D shape [1, 1, seqLen, seqLen] for broadcast compatibility with multi-head attention scores
@@ -78,40 +71,21 @@ public class MultiBatchTrainer {
                 int numBatches = dataset.getNumBatches(batchSize);
 
                 for (int b = 0; b < numBatches; b++) {
-                    StoryDataset.Batch batch = dataset.getBatch(manager, b, batchSize);
-                    long currentBatchSize = batch.inputs.getShape().get(0);
+                    // Everything belonging to one step (batch tensors, embeddings, activations, RoPE tables) lives in
+                    // one sub-manager and is freed when the step ends
+                    try (NDManager childManager = manager.newSubManager()) {
+                        StoryDataset.Batch batch = dataset.getBatch(childManager, b, batchSize);
 
-                    // Extract input batch IDs to Java memory in ONE native call
-                    float[] inputIds = batch.inputs.toFloatArray();
-                    float[] batchEmbedData = new float[(int) (currentBatchSize * seqLen * dModel)];
+                        try (GradientCollector gc = childManager.getEngine().newGradientCollector()) {
+                            NDArray logits = model.forwardIds(childManager, batch.inputs, causalMask);
+                            NDArray loss = CausalLossCalculator.calculateLoss(childManager, logits, batch.targets, vocab.getPadId());
 
-                    // Vectorized embedding reconstruction
-                    for (int i = 0; i < currentBatchSize; i++) {
-                        for (int t = 0; t < seqLen; t++) {
-                            int tokenId = (int) inputIds[i * seqLen + t];
-                            int srcPos = tokenId * dModel;
-                            int dstPos = (int) ((i * seqLen + t) * dModel);
-                            System.arraycopy(embedFlat, srcPos, batchEmbedData, dstPos, dModel);
+                            gc.backward(loss);
+                            totalEpochLoss += loss.toFloatArray()[0];
                         }
+
+                        optimizer.step();
                     }
-
-                    try (NDManager childManager = manager.newSubManager();
-                         GradientCollector gc = childManager.getEngine().newGradientCollector()) {
-
-                        NDArray batchInputX = childManager.create(batchEmbedData).reshape(new Shape(currentBatchSize, seqLen, dModel));
-
-                        // Forward pass & Causal Loss
-                        NDArray logits = model.forward(childManager, batchInputX, causalMask);
-                        NDArray loss = CausalLossCalculator.calculateLoss(childManager, logits, batch.targets, vocab.getPadId());
-                        
-                        gc.backward(loss);
-                        totalEpochLoss += loss.toFloatArray()[0];
-                    }
-
-                    optimizer.step();
-                    
-                    // Sync refreshed weight cache after optimizer step
-                    embedFlat = embeddingTable.toFloatArray();
                 }
 
                 float avgLoss = totalEpochLoss / numBatches;

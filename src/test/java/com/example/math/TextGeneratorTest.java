@@ -1,120 +1,109 @@
 package com.generation;
 
+import ai.djl.engine.Engine;
 import ai.djl.ndarray.NDArray;
 import ai.djl.ndarray.NDManager;
-import ai.djl.ndarray.types.DataType;
-import ai.djl.ndarray.types.Shape;
 import com.transformer.BlockStackLM;
 import com.transformer.CausalMaskGenerator;
-import com.generation.Sampler;
-import com.generation.TextGenerator;
-import com.transformer.RopeEmbeddings;
+import com.transformer.LMConfig;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 
+import java.util.ArrayList;
 import java.util.List;
 
 public class TextGeneratorTest {
 
+    private static final int VOCAB = 13;
+
+    private static BlockStackLM model(NDManager manager) {
+        Engine.getInstance().setRandomSeed(5);
+        return new BlockStackLM(manager, new LMConfig(2, 16, 2, 32, VOCAB, 1e-5f));
+    }
+
+    /** The slow, obviously correct reference: re-run the whole sequence for every new token. */
+    private static List<Integer> greedyByFullRecompute(NDManager manager, BlockStackLM model, int[] prompt, int count) {
+        List<Integer> ids = new ArrayList<>();
+        for (int p : prompt) ids.add(p);
+        List<Integer> generated = new ArrayList<>();
+        for (int i = 0; i < count; i++) {
+            try (NDManager scope = manager.newSubManager()) {
+                int len = ids.size();
+                NDArray idArray = scope.create(ids.stream().mapToInt(Integer::intValue).toArray());
+                NDArray mask = CausalMaskGenerator.createCausalMask(scope, len).squeeze(0).squeeze(0);
+                float[] last = model.forwardIds(scope, idArray, mask).get((long) (len - 1)).toFloatArray();
+                int best = 0;
+                for (int k = 1; k < last.length; k++) if (last[k] > last[best]) best = k;
+                ids.add(best);
+                generated.add(best);
+            }
+        }
+        return generated;
+    }
+
     @Test
-    public void testAutoregressiveGenerationLoop() {
+    public void testGreedyCachedGenerationMatchesFullRecompute() {
         try (NDManager manager = NDManager.newBaseManager()) {
-            int numLayers = 2;
-            int dModel = 16;
-            int numHeads = 2;
-            int headDim = dModel / numHeads;
-            int dFF = 32;
-            int vocabSize = 20;
-            int promptLen = 4;
-            int maxGenTokens = 5;
-            int maxSeqLen = promptLen + maxGenTokens;
-            float eps = 1e-5f;
-            int eosTokenId = 18; // Specific EOS token for stop condition test
+            BlockStackLM model = model(manager);
+            int[] prompt = {1, 2, 3};
 
-            // 1. Instantiate Model, Sampler, and TextGenerator
-            BlockStackLM model = new BlockStackLM(manager, numLayers, dModel, numHeads, dFF, vocabSize, eps);
-            Sampler sampler = new Sampler();
-            TextGenerator generator = new TextGenerator(model, sampler);
+            List<Integer> cached = new TextGenerator(model, new Sampler(1))
+                    .generate(manager, prompt, 8, -1, 0.0f, 0, 1.0f, 1.0f);
 
-            // 2. Prepare Mock Input Data & Pre-computed RoPE Frequencies
-            NDArray promptEmbeddings = manager.randomNormal(0.0f, 1.0f, new Shape(promptLen, dModel), DataType.FLOAT32);
-
-            // Compute static RoPE frequency matrices for max sequence length
-            NDArray[] ropePair = RopeEmbeddings.computeCosSin(manager, maxSeqLen, headDim, 10000.0f);
-            NDArray fullCos = ropePair[0];
-            NDArray fullSin = ropePair[1];
-
-            // 3. Execute End-to-End Generation Loop
-            List<Integer> generatedTokens = generator.generate(
-                    manager,
-                    promptEmbeddings,
-                    fullCos,
-                    fullSin,
-                    maxGenTokens,
-                    eosTokenId,
-                    0.8f,    // Temperature
-                    5,       // Top-K
-                    0.9f,    // Top-P
-                    1.1f     // Repetition Penalty
-            );
-
-            // 4. Assertions
-            Assertions.assertNotNull(generatedTokens, "Generated token list should not be null");
-            Assertions.assertFalse(generatedTokens.isEmpty(), "Generated token list should contain at least one token");
-            Assertions.assertTrue(generatedTokens.size() <= maxGenTokens, 
-                    "Generated token count should not exceed maxGenTokens (" + maxGenTokens + ")");
-
-            System.out.println("Generated Token IDs: " + generatedTokens);
-            System.out.println("Total Tokens Generated: " + generatedTokens.size());
-            System.out.println("SUCCESS: TextGenerator end-to-end loop verified.");
+            // Equality with the reference proves that every sampled token is embedded and fed back at the right position
+            Assertions.assertEquals(greedyByFullRecompute(manager, model, prompt, 8), cached);
         }
     }
 
     @Test
-    public void testEarlyEosTermination() {
+    public void testGreedyGenerationIsDeterministic() {
         try (NDManager manager = NDManager.newBaseManager()) {
-            int numLayers = 1;
-            int dModel = 8;
-            int numHeads = 2;
-            int headDim = dModel / numHeads;
-            int dFF = 16;
-            int vocabSize = 10;
-            int promptLen = 2;
-            int maxGenTokens = 10;
-            int maxSeqLen = promptLen + maxGenTokens;
-            float eps = 1e-5f;
+            BlockStackLM model = model(manager);
+            TextGenerator generator = new TextGenerator(model, new Sampler(1));
+            List<Integer> first = generator.generate(manager, new int[]{4, 5}, 6, -1, 0.0f, 0, 1.0f, 1.0f);
+            List<Integer> second = generator.generate(manager, new int[]{4, 5}, 6, -1, 0.0f, 0, 1.0f, 1.0f);
+            Assertions.assertEquals(first, second);
+        }
+    }
 
-            BlockStackLM model = new BlockStackLM(manager, numLayers, dModel, numHeads, dFF, vocabSize, eps);
-            
-            Sampler greedySampler = new Sampler() {
-                @Override
-                public int sampleMultinomial(NDArray probabilities) {
-                    return (int) probabilities.argMax().getLong();
-                }
-            };
-            TextGenerator generator = new TextGenerator(model, greedySampler);
+    @Test
+    public void testStopsAfterEndOfSequenceToken() {
+        try (NDManager manager = NDManager.newBaseManager()) {
+            BlockStackLM model = model(manager);
+            TextGenerator generator = new TextGenerator(model, new Sampler(1));
+            int[] prompt = {1, 2, 3};
+            int firstToken = generator.generate(manager, prompt, 1, -1, 0.0f, 0, 1.0f, 1.0f).get(0);
 
-            NDArray promptEmbeddings = manager.randomNormal(0.0f, 1.0f, new Shape(promptLen, dModel), DataType.FLOAT32);
-            NDArray[] ropePair = RopeEmbeddings.computeCosSin(manager, maxSeqLen, headDim, 10000.0f);
+            List<Integer> stopped = generator.generate(manager, prompt, 10, firstToken, 0.0f, 0, 1.0f, 1.0f);
+            Assertions.assertEquals(List.of(firstToken), stopped, "the EOS token is included and generation ends there");
+        }
+    }
 
-            // Generate valid causal mask for multi-token prompt evaluation
-            NDArray promptMask = CausalMaskGenerator.createCachedMask(manager, promptLen, promptLen);
-            NDArray promptCos = ropePair[0].get("0:" + promptLen);
-            NDArray promptSin = ropePair[1].get("0:" + promptLen);
+    @Test
+    public void testRespectsMaxGenTokens() {
+        try (NDManager manager = NDManager.newBaseManager()) {
+            TextGenerator generator = new TextGenerator(model(manager), new Sampler(1));
+            Assertions.assertEquals(5, generator.generate(manager, new int[]{1}, 5, -1, 0.8f, 5, 0.9f, 1.1f).size());
+            Assertions.assertTrue(generator.generate(manager, new int[]{1}, 0, -1, 0.8f, 5, 0.9f, 1.1f).isEmpty());
+        }
+    }
 
-            int eosTokenId = (int) model.forward(manager, promptEmbeddings, promptMask, promptCos, promptSin)
-                    .get((promptLen - 1) + ":")
-                    .argMax()
-                    .getLong();
+    @Test
+    public void testSeededSamplingIsReproducible() {
+        try (NDManager manager = NDManager.newBaseManager()) {
+            BlockStackLM model = model(manager);
+            List<Integer> a = new TextGenerator(model, new Sampler(7)).generate(manager, new int[]{1, 2}, 8, -1, 1.0f, 0, 1.0f, 1.0f);
+            List<Integer> b = new TextGenerator(model, new Sampler(7)).generate(manager, new int[]{1, 2}, 8, -1, 1.0f, 0, 1.0f, 1.0f);
+            Assertions.assertEquals(a, b);
+        }
+    }
 
-            List<Integer> generatedTokens = generator.generate(
-                    manager, promptEmbeddings, ropePair[0], ropePair[1],
-                    maxGenTokens, eosTokenId, 1.0f, 0, 1.0f, 1.0f
-            );
-
-            Assertions.assertEquals(1, generatedTokens.size(), "Generator should terminate immediately on EOS token");
-            Assertions.assertEquals(eosTokenId, generatedTokens.get(0).intValue(), "First token generated should match EOS ID");
-            System.out.println("SUCCESS: Early EOS termination verified.");
+    @Test
+    public void testRejectsEmptyPrompt() {
+        try (NDManager manager = NDManager.newBaseManager()) {
+            TextGenerator generator = new TextGenerator(model(manager), new Sampler(1));
+            Assertions.assertThrows(IllegalArgumentException.class,
+                    () -> generator.generate(manager, new int[0], 5, -1, 0.0f, 0, 1.0f, 1.0f));
         }
     }
 }

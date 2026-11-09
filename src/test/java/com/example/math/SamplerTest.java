@@ -45,4 +45,17 @@ public class SamplerTest {
             System.out.println("SUCCESS: Logits processing and sampling verified.");
         }
     }
+
+    @Test
+    public void testNeverSamplesFilteredTokens() {
+        try (NDManager manager = NDManager.newBaseManager()) {
+            float ninf = Float.NEGATIVE_INFINITY;
+            NDArray logits = manager.create(new float[]{ninf, 0.0f, ninf, 1.0f, ninf});
+            Sampler sampler = new Sampler(7);
+            for (int i = 0; i < 5000; i++) {
+                int token = sampler.sampleMultinomial(logits);
+                Assertions.assertTrue(token == 1 || token == 3, "sampled a filtered-out token: " + token);
+            }
+        }
+    }
 }

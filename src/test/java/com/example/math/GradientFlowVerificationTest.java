@@ -3,6 +3,7 @@ package com.example.math;
 import com.transformer.LayerNorm;
 import com.transformer.GradientEngine;
 import com.transformer.CausalMaskGenerator;
+import com.transformer.RopeEmbeddings;
 import com.encoder.ModernizedHierarchicalEncoderPipeline;
 import ai.djl.ndarray.NDArray;
 import ai.djl.ndarray.NDManager;
@@ -110,8 +111,9 @@ public class GradientFlowVerificationTest {
                 NDArray V_split = V.reshape(new Shape(seqLen, numHeads, dK)).transpose(1, 0, 2);
 
                 // Fully differentiable RoPE rotation
-                NDArray Q_rope = ModernizedHierarchicalEncoderPipeline.applyRoPE(manager, Q_split);
-                NDArray K_rope = ModernizedHierarchicalEncoderPipeline.applyRoPE(manager, K_split);
+                NDArray[] rope = RopeEmbeddings.computeCosSin(manager, seqLen, dK);
+                NDArray Q_rope = RopeEmbeddings.applyRope(Q_split.expandDims(0), rope[0], rope[1]).squeeze(0);
+                NDArray K_rope = RopeEmbeddings.applyRope(K_split.expandDims(0), rope[0], rope[1]).squeeze(0);
 
                 NDArray scores = Q_rope.matMul(K_rope.transpose(0, 2, 1)).div(Math.sqrt(dK));
                 NDArray maskedScores = scores.add(causalMask);

@@ -74,6 +74,10 @@ public class AdamOptimizer {
 
             // 5. In-place gradient descent update: param = param - step
             param.subi(step);
+
+            // backward() ADDS to the existing gradient, so it has to be reset or every step would also contain
+            // the gradients of all previous steps
+            grad.muli(0f);
         }
     }
 

@@ -1,10 +1,11 @@
 package com.example.math;
 
 import com.decoder.DecoderBlock;
-import com.decoder.DecoderBlockResult;
 import com.transformer.GradientEngine;
 import com.transformer.CausalMaskGenerator;
-import com.encoder.ModernizedHierarchicalEncoderPipeline;
+import com.transformer.KVCacheBuffer;
+import com.transformer.RopeEmbeddings;
+import ai.djl.engine.Engine;
 import ai.djl.ndarray.NDArray;
 import ai.djl.ndarray.NDManager;
 import ai.djl.ndarray.types.DataType;
@@ -55,7 +56,7 @@ class DecoderBlockTest {
         NDArray causalMask = causalMask4D.squeeze(0).squeeze(0);
 
         // 4. Pre-compute RoPE tables using correct pipeline method
-        NDArray[] ropeTables = ModernizedHierarchicalEncoderPipeline.precomputeRoPEFrequencies(manager, seqLen, dK);
+        NDArray[] ropeTables = RopeEmbeddings.computeCosSin(manager, seqLen, dK);
         NDArray cos = ropeTables[0];
         NDArray sin = ropeTables[1];
 
@@ -126,7 +127,7 @@ class DecoderBlockTest {
         int n = 6, d = 16;
         DecoderBlock block = new DecoderBlock(manager, d, 2, 32, 1e-5f);
         NDArray mask = CausalMaskGenerator.createCausalMask(manager, n).squeeze(0).squeeze(0);
-        NDArray[] rope = ModernizedHierarchicalEncoderPipeline.precomputeRoPEFrequencies(manager, n, d / 2);
+        NDArray[] rope = RopeEmbeddings.computeCosSin(manager, n, d / 2);
 
         float[][] base = new float[n][d];
         for (int i = 0; i < n; i++) for (int j = 0; j < d; j++) base[i][j] = (float) Math.sin(i * 31 + j);
@@ -151,7 +152,7 @@ class DecoderBlockTest {
         int n = 4, d = 16;
         DecoderBlock block = new DecoderBlock(manager, d, 2, 32, 1e-5f);
         NDArray mask = CausalMaskGenerator.createCausalMask(manager, n).squeeze(0).squeeze(0);
-        NDArray[] rope = ModernizedHierarchicalEncoderPipeline.precomputeRoPEFrequencies(manager, n, d / 2);
+        NDArray[] rope = RopeEmbeddings.computeCosSin(manager, n, d / 2);
         NDArray x = manager.randomNormal(0.0f, 1.0f, new Shape(n, d), DataType.FLOAT32);
 
         assertArrayEquals(block.forward(x, mask, rope[0], rope[1]).toFloatArray(),
@@ -192,25 +193,6 @@ class DecoderBlockTest {
     }
 
     @Test
-    @DisplayName("Cached decoding step needs a mask of exactly [newTokens, cached + new]")
-    void testCachedStepRequiresExactMask() {
-        int d = 16;
-        DecoderBlock block = new DecoderBlock(manager, d, 2, 32, 1e-5f);
-        NDArray prompt = manager.randomNormal(0.0f, 1.0f, new Shape(3, d), DataType.FLOAT32);
-        NDArray promptMask = CausalMaskGenerator.createCausalMask(manager, 3).squeeze(0).squeeze(0);
-        DecoderBlockResult prefill = block.forwardWithCache(manager, prompt, promptMask, null, null);
-
-        NDArray next = manager.randomNormal(0.0f, 1.0f, new Shape(1, d), DataType.FLOAT32);
-        NDArray wrong = manager.zeros(new Shape(1, 3), DataType.FLOAT32); // forgot to count the new token
-        assertThrows(IllegalArgumentException.class,
-                () -> block.forwardWithCache(manager, next, wrong, prefill.kCache, prefill.vCache));
-
-        NDArray right = CausalMaskGenerator.createCachedMask(manager, 1, 4);
-        DecoderBlockResult step = block.forwardWithCache(manager, next, right, prefill.kCache, prefill.vCache);
-        assertEquals(4L, step.kCache.getShape().get(2), "cache should now hold 3 + 1 positions");
-    }
-
-    @Test
     @DisplayName("createCachedMask equals the last rows of the full causal mask")
     void testCachedMaskMatchesLastRowsOfFullMask() {
         float[] cached = CausalMaskGenerator.createCachedMask(manager, 2, 5).toFloatArray();
@@ -220,17 +202,107 @@ class DecoderBlockTest {
     }
 
     @Test
-    @DisplayName("Passing cos/sin where the KV caches belong is rejected (the old overload silently accepted it)")
-    void testCosSinAsCacheIsRejected() {
-        int d = 16;
-        DecoderBlock block = new DecoderBlock(manager, d, 2, 32, 1e-5f);
-        NDArray x = manager.randomNormal(0.0f, 1.0f, new Shape(1, d), DataType.FLOAT32);
-        NDArray notACache = manager.ones(new Shape(1, d / 2), DataType.FLOAT32);
+    @DisplayName("A cached step needs a mask of exactly [newTokens, cached + new]; a rejected call leaves the cache untouched")
+    void testCachedStepRequiresExactMask() {
+        int d = 16, heads = 2;
+        DecoderBlock block = new DecoderBlock(manager, d, heads, 32, 1e-5f);
+        KVCacheBuffer cache = new KVCacheBuffer(manager, 1, heads, 8, d / heads);
+        NDArray prompt = manager.randomNormal(0.0f, 1.0f, new Shape(3, d), DataType.FLOAT32);
+        block.forwardWithBuffer(manager, prompt, CausalMaskGenerator.createCachedMask(manager, 3, 3), cache);
+        assertEquals(3, cache.getCurrentLength());
 
-        assertThrows(IllegalArgumentException.class,
-                () -> block.forwardWithCache(manager, x, null, notACache, notACache));
-        // only one of the two caches provided
-        assertThrows(IllegalArgumentException.class,
-                () -> block.forwardWithCache(manager, x, null, null, notACache));
+        NDArray next = manager.randomNormal(0.0f, 1.0f, new Shape(1, d), DataType.FLOAT32);
+        NDArray wrong = manager.zeros(new Shape(1, 3), DataType.FLOAT32); // forgot to count the new token
+        assertThrows(IllegalArgumentException.class, () -> block.forwardWithBuffer(manager, next, wrong, cache));
+        assertEquals(3, cache.getCurrentLength(), "a rejected call must not have written to the cache");
+
+        block.forwardWithBuffer(manager, next, CausalMaskGenerator.createCachedMask(manager, 1, 4), cache);
+        assertEquals(4, cache.getCurrentLength());
+    }
+
+    @Test
+    @DisplayName("Overflowing the KV cache is rejected and leaves the cache untouched")
+    void testCacheOverflowRejected() {
+        int d = 16, heads = 2;
+        DecoderBlock block = new DecoderBlock(manager, d, heads, 32, 1e-5f);
+        KVCacheBuffer cache = new KVCacheBuffer(manager, 1, heads, 4, d / heads); // room for 4 positions
+        NDArray three = manager.randomNormal(0.0f, 1.0f, new Shape(3, d), DataType.FLOAT32);
+        block.forwardWithBuffer(manager, three, CausalMaskGenerator.createCachedMask(manager, 3, 3), cache);
+
+        NDArray two = manager.randomNormal(0.0f, 1.0f, new Shape(2, d), DataType.FLOAT32);
+        NDArray mask = CausalMaskGenerator.createCachedMask(manager, 2, 5);
+        assertThrows(IllegalStateException.class, () -> block.forwardWithBuffer(manager, two, mask, cache));
+        assertEquals(3, cache.getCurrentLength());
+    }
+
+    @Test
+    @DisplayName("RoPE tables are mandatory and must cover exactly the tokens being processed")
+    void testRopeTablesAreMandatoryAndExact() {
+        int d = 16, heads = 2, hd = d / heads, n = 4;
+        DecoderBlock block = new DecoderBlock(manager, d, heads, 32, 1e-5f);
+        NDArray x = manager.randomNormal(0.0f, 1.0f, new Shape(n, d), DataType.FLOAT32);
+        NDArray mask = CausalMaskGenerator.createCausalMask(manager, n).squeeze(0).squeeze(0);
+        NDArray[] whole = RopeEmbeddings.computeCosSin(manager, 8, hd); // 8 positions, but only 4 tokens
+
+        assertThrows(IllegalArgumentException.class, () -> block.forward(x, mask, null, null)); // there is no "no RoPE" mode
+        IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
+                () -> block.forward(x, mask, whole[0], whole[1]));
+        assertTrue(e.getMessage().contains("RopeEmbeddings.slice"), "message should point to slice(): " + e.getMessage());
+
+        // the classic trap: handing the whole table to a single-token step would silently use position 0
+        NDArray one = manager.randomNormal(0.0f, 1.0f, new Shape(1, d), DataType.FLOAT32);
+        assertThrows(IllegalArgumentException.class, () -> block.forward(one, null, whole[0], whole[1]));
+    }
+
+    @Test
+    @DisplayName("The convenience overload that builds its own tables equals the explicit one")
+    void testOwnTablesEqualExplicitTables() {
+        int d = 16, heads = 2, n = 5;
+        DecoderBlock block = new DecoderBlock(manager, d, heads, 32, 1e-5f);
+        NDArray x = manager.randomNormal(0.0f, 1.0f, new Shape(n, d), DataType.FLOAT32);
+        NDArray mask = CausalMaskGenerator.createCausalMask(manager, n).squeeze(0).squeeze(0);
+        NDArray[] t = RopeEmbeddings.computeCosSin(manager, n, d / heads);
+
+        assertArrayEquals(block.forward(x, mask, t[0], t[1]).toFloatArray(),
+                block.forward(manager, x, mask).toFloatArray(), 1e-6f);
+    }
+
+    private static float[] lastRow(NDArray out, int n, int d) {
+        float[] all = out.toFloatArray();
+        return java.util.Arrays.copyOfRange(all, (n - 1) * d, n * d);
+    }
+
+    private static float maxAbsDiff(float[] a, float[] b) {
+        float m = 0f;
+        for (int i = 0; i < a.length; i++) m = Math.max(m, Math.abs(a[i] - b[i]));
+        return m;
+    }
+
+    @Test
+    @DisplayName("RoPE gives the block a sense of order: swapping two EARLIER tokens changes the last position")
+    void testRopeMakesTheBlockOrderSensitive() {
+        Engine.getInstance().setRandomSeed(11);
+        int n = 5, d = 16, heads = 2, hd = d / heads;
+        DecoderBlock block = new DecoderBlock(manager, d, heads, 32, 1e-5f);
+        NDArray mask = CausalMaskGenerator.createCausalMask(manager, n).squeeze(0).squeeze(0);
+
+        float[][] a = new float[n][d];
+        for (int i = 0; i < n; i++) for (int j = 0; j < d; j++) a[i][j] = (float) Math.sin(i * 1.7 + j * 0.9);
+        float[][] b = new float[n][];
+        for (int i = 0; i < n; i++) b[i] = a[i].clone();
+        b[0] = a[1].clone();
+        b[1] = a[0].clone(); // the same tokens, with tokens 0 and 1 swapped
+
+        NDArray[] real = RopeEmbeddings.computeCosSin(manager, n, hd);
+        float[] withA = lastRow(block.forward(manager.create(a), mask, real[0], real[1]), n, d);
+        float[] withB = lastRow(block.forward(manager.create(b), mask, real[0], real[1]), n, d);
+        assertTrue(maxAbsDiff(withA, withB) > 1e-3f, "with RoPE the order of earlier tokens must matter");
+
+        // Control: identity tables (cos = 1, sin = 0) rotate nothing, so the last token sees an unordered set
+        NDArray identityCos = manager.ones(new Shape(n, hd), DataType.FLOAT32);
+        NDArray identitySin = manager.zeros(new Shape(n, hd), DataType.FLOAT32);
+        float[] idA = lastRow(block.forward(manager.create(a), mask, identityCos, identitySin), n, d);
+        float[] idB = lastRow(block.forward(manager.create(b), mask, identityCos, identitySin), n, d);
+        assertTrue(maxAbsDiff(idA, idB) < 1e-4f, "without RoPE the order of earlier tokens cannot matter here");
     }
 }

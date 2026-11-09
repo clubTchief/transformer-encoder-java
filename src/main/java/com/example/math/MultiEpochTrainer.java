@@ -9,6 +9,7 @@ import ai.djl.ndarray.types.DataType;
 import ai.djl.ndarray.types.Shape;
 import ai.djl.training.GradientCollector;
 import com.transformer.BlockStackLM;
+import com.transformer.LMConfig;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -63,15 +64,12 @@ public class MultiEpochTrainer {
             }
 
             // Initialize Model Stack and Gradient Engine
-            BlockStackLM model = new BlockStackLM(manager, dModel, numHeads, numLayers, dFF, vocabSize, eps);
+            // (The old call passed dModel/numHeads/numLayers in the wrong positions; LMConfig names every field.)
+            BlockStackLM model = new BlockStackLM(manager, new LMConfig(numLayers, dModel, numHeads, dFF, vocabSize, eps));
             GradientEngine gradEngine = new GradientEngine(learningRate);
 
-            // Initialize Input Embedding Table [vocabSize, dModel]
-            NDArray embeddingTable = manager.randomNormal(0.0f, 0.02f, new Shape(vocabSize, dModel), DataType.FLOAT32);
-            embeddingTable.setRequiresGradient(true);
-
-            List<NDArray> fullTrainableParams = new ArrayList<>(model.params());
-            fullTrainableParams.add(embeddingTable);
+            // The embedding table is part of the model (tied with the output head)
+            List<NDArray> fullTrainableParams = model.params();
 
             // Create 2D Causal Mask for Attention [trainLen, trainLen]
             NDArray causalMask4D = CausalMaskGenerator.createCausalMask(manager, trainLen);
@@ -91,23 +89,18 @@ public class MultiEpochTrainer {
             for (int epoch = 1; epoch <= epochs; epoch++) {
                 float epochLoss;
 
-                try (GradientCollector collector = gradEngine.createCollector()) {
+                try (NDManager scope = manager.newSubManager();
+                     GradientCollector collector = gradEngine.createCollector()) {
 
-                    // 1. Build inputX dynamically for tokens 0..N-2
-                    NDArray inputX = manager.create(new Shape(trainLen, dModel), DataType.FLOAT32);
-                    for (int i = 0; i < trainLen; i++) {
-                        NDArray tokenVec = embeddingTable.get(inputTokenIds[i]);
-                        inputX.set(new ai.djl.ndarray.index.NDIndex("{}:{}", i, i + 1), tokenVec);
-                    }
+                    // 1. Token ids -> embeddings -> logits (the embedding look-up is part of the model)
+                    NDArray ids = scope.create(inputTokenIds);
+                    NDArray logits = model.forwardIds(scope, ids, causalMask);
 
-                    // 2. Forward pass
-                    NDArray logits = model.forward(manager, inputX, causalMask);
-
-                    // 3. Loss calculation predicting tokens 1..N-1
-                    NDArray lossTensor = computeDifferentiableLoss(manager, logits, targetTokenIds);
+                    // 2. Loss calculation predicting tokens 1..N-1
+                    NDArray lossTensor = computeDifferentiableLoss(scope, logits, targetTokenIds);
                     epochLoss = lossTensor.toFloatArray()[0];
 
-                    // 4. Backward pass
+                    // 3. Backward pass
                     collector.backward(lossTensor);
                 }
 
@@ -150,19 +143,13 @@ public class MultiEpochTrainer {
             for (int step = 0; step < maxTokensToGenerate; step++) {
                 int currentLen = generatedIds.size();
 
-                NDArray genInputX = manager.create(new Shape(currentLen, dModel), DataType.FLOAT32);
-                for (int i = 0; i < currentLen; i++) {
-                    NDArray tokenVec = embeddingTable.get(generatedIds.get(i));
-                    genInputX.set(new ai.djl.ndarray.index.NDIndex("{}:{}", i, i + 1), tokenVec);
+                float[] logitVals;
+                try (NDManager scope = manager.newSubManager()) {
+                    NDArray genIds = scope.create(generatedIds.stream().mapToInt(Integer::intValue).toArray());
+                    NDArray genMask = CausalMaskGenerator.createCausalMask(scope, currentLen).squeeze(0).squeeze(0);
+                    NDArray logits = model.forwardIds(scope, genIds, genMask);
+                    logitVals = logits.get((long) (currentLen - 1)).toFloatArray();
                 }
-
-                NDArray genMask4D = CausalMaskGenerator.createCausalMask(manager, currentLen);
-                NDArray genMask = genMask4D.squeeze(0).squeeze(0);
-                NDArray logits = model.forward(manager, genInputX, genMask);
-
-                NDArray lastLogits = logits.get((long) (currentLen - 1));
-
-                float[] logitVals = lastLogits.toFloatArray();
                 int bestTokenId = 0;
                 float maxVal = Float.NEGATIVE_INFINITY;
                 for (int v = 0; v < logitVals.length; v++) {

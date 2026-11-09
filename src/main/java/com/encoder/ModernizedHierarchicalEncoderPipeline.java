@@ -10,6 +10,7 @@ import ai.djl.repository.zoo.Criteria;
 import ai.djl.repository.zoo.ZooModel;
 import ai.djl.training.GradientCollector;
 import com.transformer.CausalMaskGenerator;
+import com.transformer.RopeEmbeddings;
 import com.decoder.DecoderBlock;
 import com.transformer.GradientEngine;
 
@@ -99,7 +100,7 @@ public class ModernizedHierarchicalEncoderPipeline {
 
                 // Pre-compute RoPE cos/sin frequencies ONCE per forward pass to eliminate memory leaks
                 int dK = dModel / numHeads;
-                NDArray[] ropeFreqs = precomputeRoPEFrequencies(manager, seqLen, dK);
+                NDArray[] ropeFreqs = RopeEmbeddings.computeCosSin(manager, seqLen, dK);
                 NDArray cos = ropeFreqs[0];
                 NDArray sin = ropeFreqs[1];
 
@@ -138,48 +139,7 @@ public class ModernizedHierarchicalEncoderPipeline {
     // EFFICIENT ROPE PRE-COMPUTATION & VECTOR-NATIVE ROTATION HELPERS
     // =========================================================================
 
-    public static NDArray[] precomputeRoPEFrequencies(NDManager manager, long seqLen, long dK) {
-        float[] invFreq = new float[(int) (dK / 2)];
-        for (int i = 0; i < dK / 2; i++) {
-            invFreq[i] = (float) (1.0 / Math.pow(10000.0, (2.0 * i) / dK));
-        }
-        NDArray invFreqND = manager.create(invFreq);
-        NDArray posND = manager.arange(0, seqLen, 1, DataType.FLOAT32);
-
-        NDArray freqs = posND.reshape(new Shape(seqLen, 1)).matMul(invFreqND.reshape(new Shape(1, dK / 2)));
-
-        NDArray cos = freqs.cos().repeat(1, 2).reshape(new Shape(1, seqLen, dK));
-        NDArray sin = freqs.sin().repeat(1, 2).reshape(new Shape(1, seqLen, dK));
-
-        return new NDArray[]{cos, sin};
-    }
-
-    public static NDArray applyRoPE(NDArray splitTensor, NDArray cos, NDArray sin) {
-        Shape shape = splitTensor.getShape();
-        long numHeads = shape.get(0);
-        long seqLen = shape.get(1);
-        long dK = shape.get(2);
-
-        NDArray x1 = splitTensor.get("..., 0::2");
-        NDArray x2 = splitTensor.get("..., 1::2");
-
-        NDArray negX2 = x2.neg();
-        NDArray rx = negX2.stack(x1, -1).reshape(new Shape(numHeads, seqLen, dK));
-
-        return splitTensor.mul(cos).add(rx.mul(sin));
-    }
-
-    /**
-     * Helper overload for unit tests. Pre-computes frequencies dynamically.
-     */
-    public static NDArray applyRoPE(NDManager manager, NDArray splitTensor) {
-        Shape shape = splitTensor.getShape();
-        long seqLen = shape.get(1);
-        long dK = shape.get(2);
-
-        NDArray[] freqs = precomputeRoPEFrequencies(manager, seqLen, dK);
-        return applyRoPE(splitTensor, freqs[0], freqs[1]);
-    }
+    // RoPE lives in com.transformer.RopeEmbeddings: one implementation shared with DecoderBlock.
 
     public static NDArray applySwish(NDArray X) {
         NDArray denominator = X.neg().exp().add(1.0f);

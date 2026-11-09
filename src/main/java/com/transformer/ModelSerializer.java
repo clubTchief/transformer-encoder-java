@@ -80,6 +80,13 @@ public class ModelSerializer {
                     data[d] = dis.readFloat();
                 }
 
+                long[] expected = targetParams.get(i).getShape().getShape();
+                if (!java.util.Arrays.equals(shapeArray, expected)) {
+                    throw new IllegalArgumentException("Checkpoint tensor #" + i + " has shape "
+                            + java.util.Arrays.toString(shapeArray) + " but the model expects "
+                            + java.util.Arrays.toString(expected) + " (different architecture?)");
+                }
+
                 // Set raw float data directly into target tensor
                 targetParams.get(i).set(data);
             }

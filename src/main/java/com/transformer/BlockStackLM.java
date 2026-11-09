@@ -9,119 +9,153 @@ import com.decoder.DecoderBlock;
 import java.util.ArrayList;
 import java.util.List;
 
+/**
+ * Decoder-only language model: token embeddings -> N x {@link DecoderBlock} -> final RMSNorm -> output head.
+ * <p>
+ * The embedding table lives INSIDE the model and is tied with the output head (logits = hidden x embedding^T),
+ * so a checkpoint of {@link #params()} is the whole model and every parameter is trained. Look-ups are done as
+ * one-hot x table, which keeps the gradient path to the table intact (a copy through a Java array does not).
+ * <p>
+ * Pass a per-step sub-manager as {@code manager}: every intermediate tensor and the transposed head are attached
+ * to it, so closing it frees them.
+ */
 public class BlockStackLM {
 
-    private final int numLayers;
-    private final int dModel;
-    private final int numHeads;
-    private final int headDim;
-    private final int vocabSize;
+    private final LMConfig config;
+    private final NDArray embedding; // [vocabSize, dModel], also the output projection
     private final List<DecoderBlock> layers;
     private final RMSNorm finalNorm;
-    private final NDArray lmHead; // Linear projection: [dModel, vocabSize]
 
-    public BlockStackLM(NDManager manager, int numLayers, int dModel, int numHeads, int dFF, int vocabSize, float eps) {
-        this.numLayers = numLayers;
-        this.dModel = dModel;
-        this.numHeads = numHeads;
-        this.headDim = dModel / numHeads;
-        this.vocabSize = vocabSize;
+    public BlockStackLM(NDManager manager, LMConfig config) {
+        this.config = config;
 
-        this.layers = new ArrayList<>(numLayers);
-        for (int i = 0; i < numLayers; i++) {
-            layers.add(new DecoderBlock(manager, dModel, numHeads, dFF, eps));
+        this.embedding = manager.randomNormal(0.0f, 0.02f, new Shape(config.vocabSize(), config.dModel()), DataType.FLOAT32);
+        this.embedding.setRequiresGradient(true);
+
+        this.layers = new ArrayList<>(config.numLayers());
+        for (int i = 0; i < config.numLayers(); i++) {
+            layers.add(new DecoderBlock(manager, config.dModel(), config.numHeads(), config.dFF(), config.eps()));
         }
-
-        this.finalNorm = new RMSNorm(manager, dModel, eps);
-        
-        float scale = (float) Math.sqrt(2.0 / dModel);
-        this.lmHead = manager.randomUniform(-scale, scale, new Shape(dModel, vocabSize), DataType.FLOAT32);
-        this.lmHead.setRequiresGradient(true);
+        this.finalNorm = new RMSNorm(manager, config.dModel(), config.eps());
     }
 
+    // ------------------------------------------------------------------ embeddings
+
     /**
-     * Initializes pre-allocated KV Cache buffers for all transformer layers.
+     * Looks up token embeddings. ids: integer ids (any numeric dtype) of shape [seqLen] or [batch, seqLen]
+     * -> [seqLen, dModel] or [batch, seqLen, dModel]. Differentiable w.r.t. the embedding table.
      */
+    public NDArray embed(NDArray tokenIds) {
+        return tokenIds.toType(DataType.INT64, false).oneHot(config.vocabSize()).matMul(embedding);
+    }
+
+    // ------------------------------------------------------------------ full passes
+
+    /** Hidden states [.., seqLen, dModel] -> logits. cos/sin must end with [seqLen, headDim]. */
+    public NDArray forward(NDManager manager, NDArray inputX, NDArray causalMask, NDArray cos, NDArray sin) {
+        NDArray hidden = inputX;
+        for (DecoderBlock layer : layers) {
+            hidden = layer.forward(hidden, causalMask, cos, sin);
+        }
+        return project(manager, hidden);
+    }
+
+    /** Hidden states -> logits, with RoPE tables for positions 0..seqLen-1 built once and shared by all layers. */
+    public NDArray forward(NDManager manager, NDArray inputX, NDArray causalMask) {
+        Shape s = inputX.getShape();
+        NDArray[] rope = RopeEmbeddings.computeCosSin(manager, (int) s.get(s.dimension() - 2), config.headDim());
+        return forward(manager, inputX, causalMask, rope[0], rope[1]);
+    }
+
+    /** Token ids -> logits (embedding look-up included). The usual entry point for training. */
+    public NDArray forwardIds(NDManager manager, NDArray tokenIds, NDArray causalMask) {
+        return forward(manager, embed(tokenIds), causalMask);
+    }
+
+    // ------------------------------------------------------------------ cached decoding
+
+    /** One pre-allocated KV buffer per layer. */
     public List<KVCacheBuffer> createLayerBuffers(NDManager manager, int batchSize, int maxSeqLen) {
-        List<KVCacheBuffer> buffers = new ArrayList<>(numLayers);
-        for (int i = 0; i < numLayers; i++) {
-            buffers.add(new KVCacheBuffer(manager, batchSize, numHeads, maxSeqLen, headDim));
+        List<KVCacheBuffer> buffers = new ArrayList<>(config.numLayers());
+        for (int i = 0; i < config.numLayers(); i++) {
+            buffers.add(new KVCacheBuffer(manager, batchSize, config.numHeads(), maxSeqLen, config.headDim()));
         }
         return buffers;
     }
 
     /**
-     * Full sequence forward pass (non-cached, standard O(N^2) evaluation).
-     */
-    public NDArray forward(NDManager manager, NDArray inputX, NDArray causalMask, NDArray cos, NDArray sin) {
-        NDArray hidden = inputX;
-        for (DecoderBlock layer : layers) {
-            hidden = layer.forward(manager, hidden, causalMask, cos, sin);
-        }
-        NDArray normed = finalNorm.forward(hidden);
-        return normed.matMul(lmHead);
-    }
-
-    public NDArray forward(NDManager manager, NDArray inputX, NDArray causalMask) {
-        return forward(manager, inputX, causalMask, null, null);
-    }
-
-    public NDArray forward(NDArray inputX, NDArray causalMask, NDArray cos, NDArray sin) {
-        return forward(inputX.getManager(), inputX, causalMask, cos, sin);
-    }
-
-    public NDArray forward(NDArray inputX, NDArray causalMask) {
-        return forward(inputX.getManager(), inputX, causalMask, null, null);
-    }
-
-    /**
-     * Step-by-step or prompt prefill forward pass using static layer-wise KVCacheBuffers.
-     *
-     * @param inputX Hidden states tensor [batchSize, stepSeqLen, dModel] or [stepSeqLen, dModel]
-     * @param causalMask Attention mask tensor
-     * @param cos Positional cosine embeddings
-     * @param sin Positional sine embeddings
-     * @param layerBuffers Pre-allocated KV buffers for each layer
-     * @return Logits tensor over vocabulary [batchSize, stepSeqLen, vocabSize] or [stepSeqLen, vocabSize]
+     * Prefill or single-step decoding with explicit RoPE rows for the new tokens (see
+     * {@link RopeEmbeddings#slice}) and the matching cached mask ({@link CausalMaskGenerator#createCachedMask}).
      */
     public NDArray forwardWithBuffer(NDManager manager, NDArray inputX, NDArray causalMask,
-                                    NDArray cos, NDArray sin, List<KVCacheBuffer> layerBuffers) {
-        if (layerBuffers.size() != numLayers) {
+                                     NDArray cos, NDArray sin, List<KVCacheBuffer> layerBuffers) {
+        if (layerBuffers.size() != config.numLayers()) {
             throw new IllegalArgumentException(
-                String.format("Expected %d layer buffers but got %d", numLayers, layerBuffers.size())
-            );
+                    String.format("Expected %d layer buffers but got %d", config.numLayers(), layerBuffers.size()));
         }
-
         NDArray hidden = inputX;
-        for (int i = 0; i < numLayers; i++) {
-            DecoderBlock layer = layers.get(i);
-            KVCacheBuffer buffer = layerBuffers.get(i);
-            hidden = layer.forwardWithBuffer(manager, hidden, causalMask, cos, sin, buffer);
+        for (int i = 0; i < config.numLayers(); i++) {
+            hidden = layers.get(i).forwardWithBuffer(manager, hidden, causalMask, cos, sin, layerBuffers.get(i));
         }
-
-        NDArray normed = finalNorm.forward(hidden);
-        return normed.matMul(lmHead);
+        return project(manager, hidden);
     }
 
+    /** Prefill or single-step decoding; the RoPE rows are taken from the number of tokens already cached. */
+    public NDArray forwardWithBuffer(NDManager manager, NDArray inputX, NDArray causalMask,
+                                     List<KVCacheBuffer> layerBuffers) {
+        int start = layerBuffers.get(0).getCurrentLength();
+        for (KVCacheBuffer buffer : layerBuffers) {
+            if (buffer.getCurrentLength() != start) {
+                throw new IllegalStateException("Layer caches are out of sync: " + start + " vs " + buffer.getCurrentLength());
+            }
+        }
+        Shape s = inputX.getShape();
+        int newTokens = (int) s.get(s.dimension() - 2);
+        NDArray[] all = RopeEmbeddings.computeCosSin(manager, start + newTokens, config.headDim());
+        NDArray[] rows = RopeEmbeddings.slice(all[0], all[1], start, newTokens);
+        return forwardWithBuffer(manager, inputX, causalMask, rows[0], rows[1], layerBuffers);
+    }
+
+    // ------------------------------------------------------------------ plumbing
+
+    private NDArray project(NDManager scope, NDArray hidden) {
+        NDArray embeddingT = embedding.transpose();
+        embeddingT.attach(scope); // otherwise one transposed copy per call stays alive on the base manager
+        return finalNorm.forward(hidden).matMul(embeddingT);
+    }
+
+    /** All trainable tensors, embedding table last. This is exactly what a checkpoint has to contain. */
     public List<NDArray> params() {
         List<NDArray> params = new ArrayList<>();
         for (DecoderBlock layer : layers) {
             params.addAll(layer.params());
         }
         params.addAll(finalNorm.params());
-        params.add(lmHead);
+        params.add(embedding);
         return params;
     }
 
+    public LMConfig getConfig() {
+        return config;
+    }
+
+    public NDArray getEmbedding() {
+        return embedding;
+    }
+
     public int getNumLayers() {
-        return numLayers;
+        return config.numLayers();
     }
 
     public int getDModel() {
-        return dModel;
+        return config.dModel();
+    }
+
+    public int getHeadDim() {
+        return config.headDim();
     }
 
     public int getVocabSize() {
-        return vocabSize;
+        return config.vocabSize();
     }
 }

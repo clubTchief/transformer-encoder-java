@@ -1,6 +1,7 @@
 package com.example.math;
 
 import com.decoder.DecoderBlock;
+import com.transformer.RopeEmbeddings;
 import com.transformer.GradientEngine;
 import com.transformer.CausalMaskGenerator;
 import com.encoder.ModernizedHierarchicalEncoderPipeline;
@@ -64,7 +65,7 @@ class GradientEngineTest {
             int n = 6, d = 16;
             DecoderBlock block = new DecoderBlock(m, d, 2, 32, 1e-5f);
             NDArray mask = CausalMaskGenerator.createCausalMask(m, n).squeeze(0).squeeze(0);
-            NDArray[] rope = ModernizedHierarchicalEncoderPipeline.precomputeRoPEFrequencies(m, n, d / 2);
+            NDArray[] rope = RopeEmbeddings.computeCosSin(m, n, d / 2);
             NDArray x = m.randomNormal(0.0f, 1.0f, new Shape(n, d), DataType.FLOAT32);
             GradientEngine engine = new GradientEngine(1e-4f);
 

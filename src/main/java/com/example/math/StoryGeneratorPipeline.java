@@ -5,6 +5,8 @@ import ai.djl.ndarray.NDManager;
 import ai.djl.ndarray.types.DataType;
 import ai.djl.ndarray.types.Shape;
 import com.dictionary.Vocabulary;
+import com.generation.Sampler;
+import com.generation.TextGenerator;
 
 import java.io.File;
 import java.io.IOException;
@@ -45,11 +47,10 @@ public class StoryGeneratorPipeline {
             float eps = 1e-5f;
 
             // Instantiate architecture and parameter embeddings
-            BlockStackLM model = new BlockStackLM(manager, dModel, numHeads, numLayers, dFF, vocabSize, eps);
-            NDArray embeddingTable = manager.zeros(new Shape(vocabSize, dModel), DataType.FLOAT32);
+            BlockStackLM model = new BlockStackLM(manager, new LMConfig(numLayers, dModel, numHeads, dFF, vocabSize, eps));
 
-            List<NDArray> fullTrainableParams = new ArrayList<>(model.params());
-            fullTrainableParams.add(embeddingTable);
+            // The embedding table is part of the model, so params() is the whole checkpoint
+            List<NDArray> fullTrainableParams = model.params();
 
             System.out.println("================================================================================");
             System.out.println("          >>> LOADING PRODUCTION STORY GENERATOR PIPELINE <<<                   ");
@@ -87,43 +88,25 @@ public class StoryGeneratorPipeline {
             }
 
             int maxTokensToGenerate = 25;
-            int targetLength = generatedIds.size() + maxTokensToGenerate;
 
             // Sampling hyper-parameters
             float temperature = 0.7f;
             int topK = 5;
             float topP = 0.9f;
 
-            while (generatedIds.size() < targetLength) {
-                int currentLen = generatedIds.size();
+            // KV-cached generation: the prompt is processed once, then every sampled token is embedded and fed back in
+            int[] promptIds = generatedIds.stream().mapToInt(Integer::intValue).toArray();
+            TextGenerator generator = new TextGenerator(model, new Sampler());
+            List<Integer> newIds = generator.generate(manager, promptIds, maxTokensToGenerate,
+                    vocab.getId(Vocabulary.EOS_TOKEN), temperature, topK, topP, 1.0f);
 
-                // 1. Build 2D input matrix [currentLen, dModel] from embeddings
-                NDArray genInputX = manager.create(new Shape(currentLen, dModel), DataType.FLOAT32);
-                for (int i = 0; i < currentLen; i++) {
-                    NDArray tokenVec = embeddingTable.get(generatedIds.get(i));
-                    genInputX.set(new ai.djl.ndarray.index.NDIndex("{}:{}", i, i + 1), tokenVec);
-                }
-
-                // 2. Generate causal mask and compute forward logits
-                NDArray genMask4D = CausalMaskGenerator.createCausalMask(manager, currentLen);
-                NDArray genMask = genMask4D.squeeze(0).squeeze(0);
-                NDArray logits = model.forward(manager, genInputX, genMask);
-
-                // 3. Extract logit projection for the last sequence position: shape [vocabSize]
-                NDArray lastLogits = logits.get((long) (currentLen - 1));
-                float[] logitVals = lastLogits.toFloatArray();
-
-                // 4. Sample next token using Temperature + Top-P / Top-K sampling
-                int nextTokenId = SamplingUtils.sampleToken(logitVals, temperature, topK, topP);
-                String word = vocab.getToken(nextTokenId);
-
-                // Stop if generator hits EOS or PAD tokens
+            for (int id : newIds) {
+                String word = vocab.getToken(id);
+                // Stop if the generator hits EOS or PAD tokens
                 if (Vocabulary.EOS_TOKEN.equals(word) || Vocabulary.PAD_TOKEN.equals(word)) {
                     break;
                 }
-
                 System.out.print(word + " ");
-                generatedIds.add(nextTokenId);
             }
 
             System.out.println("\n\n=== GENERATION COMPLETE ===");

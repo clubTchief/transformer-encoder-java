@@ -12,6 +12,19 @@ import com.transformer.RopeEmbeddings;
 import java.util.ArrayList;
 import java.util.List;
 
+/**
+ * One Pre-RMSNorm decoder layer: causal multi-head attention with RoPE, then a SwiGLU feed-forward block.
+ * <p>
+ * Every public entry point ends in the same {@link #run} method, so training, full scoring and cached decoding
+ * cannot drift apart. Rules that used to be easy to break silently are now enforced:
+ * <ul>
+ *   <li>RoPE is always applied. The RoPE tables must end with [tokensProcessed, headDim]; null or wrongly
+ *       sized tables throw (there is no "no RoPE" mode).</li>
+ *   <li>The attention mask must be exactly [queries, keys] (see {@link CausalMaskGenerator#requireAttentionMask}).</li>
+ *   <li>Cached decoding uses a {@link KVCacheBuffer}: the new keys (already rotated) are written in place and
+ *       attention reads the active slice.</li>
+ * </ul>
+ */
 public class DecoderBlock {
 
     private final int dModel;
@@ -65,104 +78,134 @@ public class DecoderBlock {
         }
     }
 
+    // ------------------------------------------------------------------ full passes (training / scoring)
+
     /**
-     * Efficient forward pass using pre-allocated static KV-Cache buffer.
+     * Full pass over a whole sequence. cos/sin must end with [seqLen, headDim] (rotations for positions
+     * 0..seqLen-1, e.g. from {@link RopeEmbeddings#computeCosSin} sliced to seqLen rows).
+     */
+    public NDArray forward(NDArray inputX, NDArray causalMask, NDArray cos, NDArray sin) {
+        return run(inputX, causalMask, cos, sin, null);
+    }
+
+    /** Same as {@link #forward(NDArray, NDArray, NDArray, NDArray)}; the manager is not needed any more. */
+    public NDArray forward(NDManager manager, NDArray inputX, NDArray causalMask, NDArray cos, NDArray sin) {
+        return run(inputX, causalMask, cos, sin, null);
+    }
+
+    /**
+     * Full pass that builds its own RoPE tables (positions 0..seqLen-1) on {@code manager}. In a layer loop build
+     * the tables once and use the explicit form instead.
+     */
+    public NDArray forward(NDManager manager, NDArray inputX, NDArray causalMask) {
+        NDArray[] rope = RopeEmbeddings.computeCosSin(manager, (int) sequenceLength(inputX), headDim);
+        return run(inputX, causalMask, rope[0], rope[1], null);
+    }
+
+    // ------------------------------------------------------------------ cached decoding
+
+    /**
+     * Cached step or prefill. cos/sin must be the rotations for the NEW tokens only (rows
+     * [cache.getCurrentLength(), cache.getCurrentLength() + newTokens) of the full tables, see
+     * {@link RopeEmbeddings#slice}). The mask must be [newTokens, cached + newTokens]
+     * ({@link CausalMaskGenerator#createCachedMask}); null is allowed for a single new token.
      */
     public NDArray forwardWithBuffer(NDManager manager, NDArray inputX, NDArray causalMask,
                                      NDArray cos, NDArray sin, KVCacheBuffer cacheBuffer) {
-        boolean is2D = inputX.getShape().dimension() == 2;
-        NDArray x3d = is2D ? inputX.expandDims(0) : inputX;
+        if (cacheBuffer == null) {
+            throw new IllegalArgumentException("A KVCacheBuffer is required");
+        }
+        return run(inputX, causalMask, cos, sin, cacheBuffer);
+    }
 
-        NDArray normX1 = norm1.forward(x3d);
-        Shape shape = normX1.getShape();
+    /** Cached step or prefill that works out the RoPE rows from the number of tokens already in the cache. */
+    public NDArray forwardWithBuffer(NDManager manager, NDArray inputX, NDArray causalMask, KVCacheBuffer cacheBuffer) {
+        int newTokens = (int) sequenceLength(inputX);
+        int start = cacheBuffer.getCurrentLength();
+        NDArray[] all = RopeEmbeddings.computeCosSin(manager, start + newTokens, headDim);
+        NDArray[] rows = RopeEmbeddings.slice(all[0], all[1], start, newTokens);
+        return run(inputX, causalMask, rows[0], rows[1], cacheBuffer);
+    }
+
+    // ------------------------------------------------------------------ the single implementation
+
+    private NDArray run(NDArray inputX, NDArray causalMask, NDArray cos, NDArray sin, KVCacheBuffer cache) {
+        boolean is2D = inputX.getShape().dimension() == 2;
+        NDArray x = is2D ? inputX.expandDims(0) : inputX;
+
+        NDArray afterAttention = x.add(attention(norm1.forward(x), causalMask, cos, sin, cache));
+        NDArray out = afterAttention.add(swiGLU(norm2.forward(afterAttention)));
+
+        return is2D ? out.squeeze(0) : out;
+    }
+
+    /** normX: [batch, seqLen, dModel] -> attention output [batch, seqLen, dModel] (before the residual add). */
+    private NDArray attention(NDArray normX, NDArray causalMask, NDArray cos, NDArray sin, KVCacheBuffer cache) {
+        Shape shape = normX.getShape();
         long batchSize = shape.get(0);
         long seqLen = shape.get(1);
 
-        NDArray q = normX1.matMul(wQ).add(bQ);
-        NDArray k = normX1.matMul(wK).add(bK);
-        NDArray v = normX1.matMul(wV).add(bV);
+        NDArray qHead = splitHeads(normX.matMul(wQ).add(bQ), batchSize, seqLen);
+        NDArray kHead = splitHeads(normX.matMul(wK).add(bK), batchSize, seqLen);
+        NDArray vHead = splitHeads(normX.matMul(wV).add(bV), batchSize, seqLen);
 
-        NDArray qHead = q.reshape(new Shape(batchSize, seqLen, numHeads, headDim)).transpose(0, 2, 1, 3);
-        NDArray kHead = k.reshape(new Shape(batchSize, seqLen, numHeads, headDim)).transpose(0, 2, 1, 3);
-        NDArray vHead = v.reshape(new Shape(batchSize, seqLen, numHeads, headDim)).transpose(0, 2, 1, 3);
+        // Validate everything BEFORE the cache is touched: a rejected call must leave the cache exactly as it was.
+        long totalKeys = (cache == null ? 0 : cache.getCurrentLength()) + seqLen;
+        CausalMaskGenerator.requireAttentionMask(causalMask, seqLen, totalKeys);
+        requireRopeTable(cos, "cos", seqLen);
+        requireRopeTable(sin, "sin", seqLen);
 
-        // Apply RoPE to Query and Key projections before cache storage
-        if (cos != null && sin != null) {
-            qHead = RopeEmbeddings.applyRope(qHead, cos, sin);
-            kHead = RopeEmbeddings.applyRope(kHead, cos, sin);
+        // RoPE on the NEW queries/keys only. Keys already in the cache were rotated when they were stored.
+        qHead = RopeEmbeddings.applyRope(qHead, cos, sin);
+        kHead = RopeEmbeddings.applyRope(kHead, cos, sin);
+
+        NDArray keys = kHead;
+        NDArray values = vHead;
+        if (cache != null) {
+            cache.update(kHead, vHead);
+            keys = cache.getActiveKeys();
+            values = cache.getActiveValues();
         }
 
-        // Update pre-allocated buffer in-place
-        cacheBuffer.update(kHead, vHead);
-
-        NDArray currentK = cacheBuffer.getActiveKeys();
-        NDArray currentV = cacheBuffer.getActiveValues();
-
-        NDArray scores = qHead.matMul(currentK.transpose(0, 1, 3, 2)).div(Math.sqrt(headDim));
-        long totalSeqLen = currentK.getShape().get(2);
-
-        CausalMaskGenerator.requireAttentionMask(causalMask, seqLen, totalSeqLen);
+        NDArray scores = qHead.matMul(keys.transpose(0, 1, 3, 2)).div(Math.sqrt(headDim));
         if (causalMask != null) {
             scores = scores.add(causalMask);
         }
 
-        NDArray attnWeights = scores.softmax(-1);
-        NDArray context = attnWeights.matMul(currentV);
-
-        NDArray concat = context.transpose(0, 2, 1, 3).reshape(new Shape(batchSize, seqLen, dModel));
-        NDArray attnOut = concat.matMul(wO).add(bO);
-        NDArray x1 = x3d.add(attnOut);
-
-        NDArray normX2 = norm2.forward(x1);
-        NDArray ffnOut = swiGLU(manager, normX2);
-        NDArray out3d = x1.add(ffnOut);
-
-        return is2D ? out3d.squeeze(0) : out3d;
+        NDArray context = scores.softmax(-1).matMul(values);
+        return context.transpose(0, 2, 1, 3).reshape(new Shape(batchSize, seqLen, dModel)).matMul(wO).add(bO);
     }
 
-    private NDArray selfAttention(NDManager manager, NDArray x, NDArray causalMask, NDArray cos, NDArray sin) {
-        Shape shape = x.getShape();
-        boolean is3D = shape.dimension() == 3;
-        
-        long batchSize = is3D ? shape.get(0) : 1;
-        long seqLen = is3D ? shape.get(1) : shape.get(0);
-
-        NDArray q = x.matMul(wQ).add(bQ);
-        NDArray k = x.matMul(wK).add(bK);
-        NDArray v = x.matMul(wV).add(bV);
-
-        NDArray qHead = q.reshape(new Shape(batchSize, seqLen, numHeads, headDim)).transpose(0, 2, 1, 3);
-        NDArray kHead = k.reshape(new Shape(batchSize, seqLen, numHeads, headDim)).transpose(0, 2, 1, 3);
-        NDArray vHead = v.reshape(new Shape(batchSize, seqLen, numHeads, headDim)).transpose(0, 2, 1, 3);
-
-        if (cos != null && sin != null) {
-            qHead = RopeEmbeddings.applyRope(qHead, cos, sin);
-            kHead = RopeEmbeddings.applyRope(kHead, cos, sin);
-        }
-
-        NDArray scores = qHead.matMul(kHead.transpose(0, 1, 3, 2)).div(Math.sqrt(headDim));
-
-        CausalMaskGenerator.requireAttentionMask(causalMask, seqLen, seqLen);
-        if (causalMask != null) {
-            scores = scores.add(causalMask);
-        }
-
-        NDArray attnWeights = scores.softmax(-1);
-        NDArray context = attnWeights.matMul(vHead);
-
-        NDArray concat = context.transpose(0, 2, 1, 3).reshape(is3D ? new Shape(batchSize, seqLen, dModel) : new Shape(seqLen, dModel));
-        return concat.matMul(wO).add(bO);
+    private NDArray splitHeads(NDArray projected, long batchSize, long seqLen) {
+        return projected.reshape(new Shape(batchSize, seqLen, numHeads, headDim)).transpose(0, 2, 1, 3);
     }
 
-    private NDArray swiGLU(NDManager manager, NDArray x) {
+    private NDArray swiGLU(NDArray x) {
         NDArray gate = x.matMul(wG).add(bG);
         NDArray up = x.matMul(wU);
 
         NDArray sigmoidGate = gate.neg().exp().add(1.0f).pow(-1.0f);
-        NDArray swishGate = gate.mul(sigmoidGate);
-        NDArray hidden = swishGate.mul(up);
+        NDArray hidden = gate.mul(sigmoidGate).mul(up);
 
         return hidden.matMul(wD).add(bD);
+    }
+
+    private void requireRopeTable(NDArray table, String name, long seqLen) {
+        if (table == null) {
+            throw new IllegalArgumentException("RoPE table '" + name + "' is required: this block always applies RoPE");
+        }
+        Shape s = table.getShape();
+        int r = s.dimension();
+        if (r < 2 || s.get(r - 2) != seqLen || s.get(r - 1) != headDim) {
+            throw new IllegalArgumentException("RoPE table '" + name + "' must end with [" + seqLen + ", " + headDim
+                    + "] (the rotations for exactly the tokens being processed) but was " + s
+                    + ". For cached decoding take the rows of the new positions with RopeEmbeddings.slice(...).");
+        }
+    }
+
+    private static long sequenceLength(NDArray x) {
+        Shape s = x.getShape();
+        return s.get(s.dimension() - 2);
     }
 
     public List<NDArray> params() {
@@ -172,135 +215,26 @@ public class DecoderBlock {
         p.add(wK); p.add(bK);
         p.add(wV); p.add(bV);
         p.add(wO); p.add(bO);
-        
+
         // RMSNorm parameters (2)
         p.addAll(norm1.params());
         p.addAll(norm2.params());
-        
+
         // SwiGLU parameters (5: wG, bG, wU, wD, bD)
         p.add(wG);
-        if (bG != null) p.add(bG); // or add gate bias if instantiated
+        p.add(bG);
         p.add(wU);
         p.add(wD);
-        if (bD != null) p.add(bD); // or add down bias if instantiated
-        
+        p.add(bD);
+
         return p;
     }
 
-    private NDArray appendToCache(NDArray past, NDArray fresh, String name, long batchSize) {
-        if (past == null) {
-            return fresh;
-        }
-        Shape s = past.getShape();
-        if (s.dimension() != 4 || s.get(0) != batchSize || s.get(1) != numHeads || s.get(3) != headDim) {
-            throw new IllegalArgumentException(name + " cache must have shape [" + batchSize + ", " + numHeads
-                    + ", pastLen, " + headDim + "] but was " + s
-                    + ". Pass the kCache/vCache returned by the previous forwardWithCache call (not cos/sin).");
-        }
-        return past.concat(fresh, 2);
+    public int getHeadDim() {
+        return headDim;
     }
 
-    /**
-     * Core 7-argument implementation: handles NDManager, RoPE cos/sin, and KV-cache tensors.
-     */
-    public DecoderBlockResult forwardWithCache(NDManager manager, NDArray inputX, NDArray causalMask,
-                                               NDArray cos, NDArray sin, NDArray pastK, NDArray pastV) {
-        boolean is2D = inputX.getShape().dimension() == 2;
-        NDArray x3d = is2D ? inputX.expandDims(0) : inputX;
-
-        NDArray normX1 = norm1.forward(x3d);
-        Shape shape = normX1.getShape();
-        long batchSize = shape.get(0);
-        long seqLen = shape.get(1);
-
-        NDArray q = normX1.matMul(wQ).add(bQ);
-        NDArray k = normX1.matMul(wK).add(bK);
-        NDArray v = normX1.matMul(wV).add(bV);
-
-        NDArray qHead = q.reshape(new Shape(batchSize, seqLen, numHeads, headDim)).transpose(0, 2, 1, 3);
-        NDArray kHead = k.reshape(new Shape(batchSize, seqLen, numHeads, headDim)).transpose(0, 2, 1, 3);
-        NDArray vHead = v.reshape(new Shape(batchSize, seqLen, numHeads, headDim)).transpose(0, 2, 1, 3);
-
-        if (cos != null && sin != null) {
-            qHead = RopeEmbeddings.applyRope(qHead, cos, sin);
-            kHead = RopeEmbeddings.applyRope(kHead, cos, sin);
-        }
-
-        if ((pastK == null) != (pastV == null)) {
-            throw new IllegalArgumentException("pastK and pastV must either both be null or both be provided");
-        }
-        NDArray currentK = appendToCache(pastK, kHead, "K", batchSize);
-        NDArray currentV = appendToCache(pastV, vHead, "V", batchSize);
-
-        NDArray scores = qHead.matMul(currentK.transpose(0, 1, 3, 2)).div(Math.sqrt(headDim));
-        long totalSeqLen = currentK.getShape().get(2);
-
-        CausalMaskGenerator.requireAttentionMask(causalMask, seqLen, totalSeqLen);
-        if (causalMask != null) {
-            scores = scores.add(causalMask);
-        }
-
-        NDArray attnWeights = scores.softmax(-1);
-        NDArray context = attnWeights.matMul(currentV);
-
-        NDArray concat = context.transpose(0, 2, 1, 3).reshape(new Shape(batchSize, seqLen, dModel));
-        NDArray attnOut = concat.matMul(wO).add(bO);
-        NDArray x1 = x3d.add(attnOut);
-
-        NDArray normX2 = norm2.forward(x1);
-        NDArray ffnOut = swiGLU(manager, normX2);
-        NDArray out3d = x1.add(ffnOut);
-
-        NDArray finalOut = is2D ? out3d.squeeze(0) : out3d;
-        return new DecoderBlockResult(finalOut, currentK, currentV);
-    }
-
-    /**
-     * 6-argument overload (without manager parameter).
-     */
-    public DecoderBlockResult forwardWithCache(NDArray inputX, NDArray causalMask, NDArray cos, NDArray sin,
-                                               NDArray pastK, NDArray pastV) {
-        return forwardWithCache(inputX.getManager(), inputX, causalMask, cos, sin, pastK, pastV);
-    }
-
-    /**
-     * 5-argument overload with NDManager (without RoPE cos/sin).
-     */
-    public DecoderBlockResult forwardWithCache(NDManager manager, NDArray inputX, NDArray causalMask,
-                                               NDArray pastK, NDArray pastV) {
-        return forwardWithCache(manager, inputX, causalMask, null, null, pastK, pastV);
-    }
-
-    /**
-     * 4-argument overload (without manager and without RoPE cos/sin).
-     */
-    public DecoderBlockResult forwardWithCache(NDArray inputX, NDArray causalMask, NDArray pastK, NDArray pastV) {
-        return forwardWithCache(inputX.getManager(), inputX, causalMask, null, null, pastK, pastV);
-    }
-
-    // 1. Core 5-argument forward pass (with manager and RoPE cos/sin)
-    public NDArray forward(NDManager manager, NDArray inputX, NDArray causalMask, NDArray cos, NDArray sin) {
-        NDArray normX1 = norm1.forward(inputX);
-        NDArray attnOut = selfAttention(manager, normX1, causalMask, cos, sin);
-        NDArray x1 = inputX.add(attnOut);
-
-        NDArray normX2 = norm2.forward(x1);
-        NDArray ffnOut = swiGLU(manager, normX2);
-        return x1.add(ffnOut);
-    }
-
-    // 2. 4-argument forward pass (uses inputX manager with RoPE cos/sin)
-    public NDArray forward(NDArray inputX, NDArray causalMask, NDArray cos, NDArray sin) {
-        return forward(inputX.getManager(), inputX, causalMask, cos, sin);
-    }
-
-    // 3. 3-argument forward pass with manager (no RoPE cos/sin)
-    public NDArray forward(NDManager manager, NDArray inputX, NDArray causalMask) {
-        return forward(manager, inputX, causalMask, null, null);
-    }
-
-    // 4. 2-argument forward pass (no manager, no RoPE cos/sin)
-    public NDArray forward(NDArray inputX, NDArray causalMask) {
-        return forward(inputX.getManager(), inputX, causalMask, null, null);
+    public int getNumHeads() {
+        return numHeads;
     }
 }

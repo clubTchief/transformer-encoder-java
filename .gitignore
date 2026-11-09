@@ -16,3 +16,5 @@ Thumbs.db
 data/
 ckpt*/
 checkpoints*/
+# trained checkpoints written by the trainers
+models/
