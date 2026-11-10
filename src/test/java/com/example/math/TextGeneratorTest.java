@@ -195,4 +195,13 @@ public class TextGeneratorTest {
                     () -> generator.generate(manager, new int[]{1}, 5, -1, 0.0f, 0, 1.0f, 1.0f, 1, null));
         }
     }
+
+    @Test
+    public void testZeroTokensIsEmptyWhateverTheWindow() {
+        try (NDManager manager = NDManager.newBaseManager()) {
+            TextGenerator generator = new TextGenerator(model(manager), new Sampler(1));
+            Assertions.assertTrue(generator.generate(manager, new int[]{1}, 0, -1, 0.0f, 0, 1.0f, 1.0f, 1, null).isEmpty());
+            Assertions.assertTrue(generator.generate(manager, new int[]{1}, -3, -1, 0.0f, 0, 1.0f, 1.0f, 2, null).isEmpty());
+        }
+    }
 }

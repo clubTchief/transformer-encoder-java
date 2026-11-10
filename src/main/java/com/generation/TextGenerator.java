@@ -77,12 +77,12 @@ public class TextGenerator {
         if (promptIds.length == 0) {
             throw new IllegalArgumentException("The prompt needs at least one token");
         }
-        if (contextWindow < 2) {
-            throw new IllegalArgumentException("contextWindow must be at least 2 but was " + contextWindow);
-        }
         List<Integer> generated = new ArrayList<>();
         if (maxGenTokens < 1) {
-            return generated;
+            return generated; // nothing to generate: no cache is needed, so the window is irrelevant
+        }
+        if (contextWindow < 2) {
+            throw new IllegalArgumentException("contextWindow must be at least 2 but was " + contextWindow);
         }
 
         List<KVCacheBuffer> buffers = model.createLayerBuffers(manager, 1, contextWindow);
