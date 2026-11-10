@@ -58,4 +58,59 @@ class AdamOptimizerTest {
             }
         }
     }
+
+    @Test
+    @DisplayName("The global gradient norm is reported, and clipping does not break the update")
+    void testGradNormIsReported() {
+        try (NDManager manager = NDManager.newBaseManager()) {
+            NDArray w = manager.ones(new Shape(3), DataType.FLOAT32);
+            w.setRequiresGradient(true);
+            AdamOptimizer optimizer = new AdamOptimizer(List.of(w), 0.1f);
+
+            backwardOnce(new GradientEngine(0f), w); // gradient [2, 2, 2]: norm sqrt(12)
+            optimizer.step(0.1f, 0f, 1.0f);
+
+            assertEquals(Math.sqrt(12), optimizer.getLastGradNorm(), 1e-4);
+            for (float v : w.toFloatArray()) {
+                assertEquals(0.9f, v, 1e-3f); // a first Adam step moves every weight by about the learning rate
+            }
+        }
+    }
+
+    @Test
+    @DisplayName("The learning rate given to step() overrides the one from the constructor")
+    void testPerStepLearningRate() {
+        try (NDManager manager = NDManager.newBaseManager()) {
+            NDArray w = manager.ones(new Shape(3), DataType.FLOAT32);
+            w.setRequiresGradient(true);
+            AdamOptimizer optimizer = new AdamOptimizer(List.of(w), 0.001f);
+
+            backwardOnce(new GradientEngine(0f), w);
+            optimizer.step(0.5f, 0f, 0f);
+
+            for (float v : w.toFloatArray()) {
+                assertEquals(0.5f, v, 1e-3f);
+            }
+        }
+    }
+
+    @Test
+    @DisplayName("Weight decay shrinks matrices but not vectors")
+    void testWeightDecayOnlyForMatrices() {
+        try (NDManager manager = NDManager.newBaseManager()) {
+            NDArray matrix = manager.ones(new Shape(2, 2), DataType.FLOAT32);
+            NDArray vector = manager.ones(new Shape(2), DataType.FLOAT32);
+            matrix.setRequiresGradient(true);
+            vector.setRequiresGradient(true);
+            AdamOptimizer optimizer = new AdamOptimizer(List.of(matrix, vector), 0.1f);
+
+            try (GradientCollector gc = new GradientEngine(0f).createCollector()) {
+                gc.backward(matrix.mul(0f).sum().add(vector.mul(0f).sum())); // zero gradients: only the decay acts
+            }
+            optimizer.step(0.1f, 0.5f, 0f);
+
+            for (float v : matrix.toFloatArray()) assertEquals(0.95f, v, 1e-5f);
+            for (float v : vector.toFloatArray()) assertEquals(1.0f, v, 1e-5f);
+        }
+    }
 }

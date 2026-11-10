@@ -44,6 +44,19 @@ public final class CharTokenizer {
         return idToChar.length;
     }
 
+    /** The vocabulary, id = position (a copy). Store it in a checkpoint to rebuild this tokenizer later. */
+    public char[] chars() {
+        return idToChar.clone();
+    }
+
+    /** Rebuilds a tokenizer from {@link #chars()}. */
+    public static CharTokenizer fromChars(char[] chars) {
+        if (chars.length < 2 || chars[EOS] != EOS_CHAR) {
+            throw new IllegalArgumentException("Not a CharTokenizer vocabulary: id 0 must be the end-of-text character");
+        }
+        return new CharTokenizer(chars.clone());
+    }
+
     public int[] encode(String text) {
         String t = text.replace(EOS_TEXT, String.valueOf(EOS_CHAR));
         int[] ids = new int[t.length()];

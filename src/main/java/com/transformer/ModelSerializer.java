@@ -2,26 +2,26 @@ package com.transformer;
 
 import ai.djl.ndarray.NDArray;
 import ai.djl.ndarray.NDManager;
-import ai.djl.ndarray.types.DataType;
 import ai.djl.ndarray.types.Shape;
 
-import java.io.IOException;
-import java.io.DataInputStream;
-import java.io.DataOutputStream;
 import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
-
+import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.Arrays;
 import java.util.List;
 
 public class ModelSerializer {
 
     /**
-     * Serializes model parameter tensors into a binary checkpoint file.
+     * Serializes model parameter tensors into a binary checkpoint file (tensors only: no architecture, no vocabulary;
+     * see {@link ModelCheckpoint} for the self-describing format).
      */
     public static void saveWeights(String filePath, List<NDArray> trainableParams) throws IOException {
         Path path = Paths.get(filePath);
@@ -30,27 +30,7 @@ public class ModelSerializer {
         }
 
         try (DataOutputStream dos = new DataOutputStream(new BufferedOutputStream(new FileOutputStream(filePath)))) {
-            dos.writeInt(trainableParams.size());
-
-            for (NDArray param : trainableParams) {
-                Shape shape = param.getShape();
-                long[] shapeArray = shape.getShape();
-
-                // Write tensor rank
-                dos.writeInt(shapeArray.length);
-
-                // Write shape dimensions
-                for (long dim : shapeArray) {
-                    dos.writeLong(dim);
-                }
-
-                // Write float values
-                float[] data = param.toFloatArray();
-                dos.writeInt(data.length);
-                for (float val : data) {
-                    dos.writeFloat(val);
-                }
-            }
+            writeTensors(dos, trainableParams);
         }
         System.out.println(" Successfully saved " + trainableParams.size() + " parameter tensors to: " + filePath);
     }
@@ -60,37 +40,66 @@ public class ModelSerializer {
      */
     public static void loadWeights(NDManager manager, String filePath, List<NDArray> targetParams) throws IOException {
         try (DataInputStream dis = new DataInputStream(new BufferedInputStream(new FileInputStream(filePath)))) {
-            int numTensors = dis.readInt();
-
-            if (numTensors != targetParams.size()) {
-                throw new IllegalArgumentException("Checkpoint tensor count (" + numTensors + 
-                        ") does not match target model parameter count (" + targetParams.size() + ")!");
-            }
-
-            for (int i = 0; i < numTensors; i++) {
-                int rank = dis.readInt();
-                long[] shapeArray = new long[rank];
-                for (int r = 0; r < rank; r++) {
-                    shapeArray[r] = dis.readLong();
-                }
-
-                int dataLen = dis.readInt();
-                float[] data = new float[dataLen];
-                for (int d = 0; d < dataLen; d++) {
-                    data[d] = dis.readFloat();
-                }
-
-                long[] expected = targetParams.get(i).getShape().getShape();
-                if (!java.util.Arrays.equals(shapeArray, expected)) {
-                    throw new IllegalArgumentException("Checkpoint tensor #" + i + " has shape "
-                            + java.util.Arrays.toString(shapeArray) + " but the model expects "
-                            + java.util.Arrays.toString(expected) + " (different architecture?)");
-                }
-
-                // Set raw float data directly into target tensor
-                targetParams.get(i).set(data);
-            }
+            readTensors(dis, targetParams);
         }
         System.out.println(" Successfully loaded " + targetParams.size() + " parameter tensors from: " + filePath);
+    }
+
+    /** Writes: tensor count, then per tensor its rank, its dimensions and its float values. */
+    public static void writeTensors(DataOutputStream dos, List<NDArray> params) throws IOException {
+        dos.writeInt(params.size());
+        for (NDArray param : params) {
+            long[] shapeArray = param.getShape().getShape();
+            dos.writeInt(shapeArray.length);
+            for (long dim : shapeArray) {
+                dos.writeLong(dim);
+            }
+            float[] data = param.toFloatArray();
+            dos.writeInt(data.length);
+            for (float val : data) {
+                dos.writeFloat(val);
+            }
+        }
+    }
+
+    /**
+     * Reads what {@link #writeTensors} wrote into existing tensors. Throws IllegalArgumentException when the count or a
+     * shape does not match the target (a checkpoint of another architecture) and IOException for damaged data.
+     */
+    public static void readTensors(DataInputStream dis, List<NDArray> targetParams) throws IOException {
+        int numTensors = dis.readInt();
+        if (numTensors != targetParams.size()) {
+            throw new IllegalArgumentException("Checkpoint tensor count (" + numTensors
+                    + ") does not match target model parameter count (" + targetParams.size() + ")!");
+        }
+
+        for (int i = 0; i < numTensors; i++) {
+            int rank = dis.readInt();
+            if (rank < 0 || rank > 8) {
+                throw new IOException("Damaged checkpoint: tensor #" + i + " claims rank " + rank);
+            }
+            long[] shapeArray = new long[rank];
+            for (int r = 0; r < rank; r++) {
+                shapeArray[r] = dis.readLong();
+            }
+
+            long[] expected = targetParams.get(i).getShape().getShape();
+            if (!Arrays.equals(shapeArray, expected)) {
+                throw new IllegalArgumentException("Checkpoint tensor #" + i + " has shape "
+                        + Arrays.toString(shapeArray) + " but the model expects "
+                        + Arrays.toString(expected) + " (different architecture?)");
+            }
+
+            int dataLen = dis.readInt();
+            if (dataLen != new Shape(shapeArray).size()) {
+                throw new IOException("Damaged checkpoint: tensor #" + i + " has " + dataLen + " values for shape "
+                        + Arrays.toString(shapeArray));
+            }
+            float[] data = new float[dataLen];
+            for (int d = 0; d < dataLen; d++) {
+                data[d] = dis.readFloat();
+            }
+            targetParams.get(i).set(data);
+        }
     }
 }

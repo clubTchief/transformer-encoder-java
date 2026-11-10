@@ -106,4 +106,93 @@ public class TextGeneratorTest {
                     () -> generator.generate(manager, new int[0], 5, -1, 0.0f, 0, 1.0f, 1.0f));
         }
     }
+
+    // ------------------------------------------------------------------ sliding context window
+
+    private static int argmaxOfLastPosition(NDManager manager, BlockStackLM model, List<Integer> tokens) {
+        try (NDManager scope = manager.newSubManager()) {
+            int len = tokens.size();
+            NDArray ids = scope.create(tokens.stream().mapToInt(Integer::intValue).toArray());
+            NDArray mask = CausalMaskGenerator.createCausalMask(scope, len).squeeze(0).squeeze(0);
+            float[] last = model.forwardIds(scope, ids, mask).get((long) (len - 1)).toFloatArray();
+            int best = 0;
+            for (int k = 1; k < last.length; k++) if (last[k] > last[best]) best = k;
+            return best;
+        }
+    }
+
+    /** The same context-shift policy as TextGenerator, but every step recomputed from scratch without any cache. */
+    private static List<Integer> greedyWithWindowByRecompute(NDManager manager, BlockStackLM model, int[] prompt, int count, int window) {
+        List<Integer> cached = new ArrayList<>();
+        for (int i = Math.max(0, prompt.length - (window - 1)); i < prompt.length; i++) cached.add(prompt[i]);
+        List<Integer> generated = new ArrayList<>();
+        int next = argmaxOfLastPosition(manager, model, cached);
+        generated.add(next);
+        while (generated.size() < count) {
+            if (cached.size() == window) {
+                cached = new ArrayList<>(cached.subList(cached.size() - window / 2, cached.size()));
+            }
+            cached.add(next);
+            next = argmaxOfLastPosition(manager, model, cached);
+            generated.add(next);
+        }
+        return generated;
+    }
+
+    @Test
+    public void testWindowLargeEnoughChangesNothing() {
+        try (NDManager manager = NDManager.newBaseManager()) {
+            BlockStackLM model = model(manager);
+            int[] prompt = {1, 2, 3};
+            TextGenerator generator = new TextGenerator(model, new Sampler(1));
+            List<Integer> plain = generator.generate(manager, prompt, 8, -1, 0.0f, 0, 1.0f, 1.0f);
+            List<Integer> windowed = generator.generate(manager, prompt, 8, -1, 0.0f, 0, 1.0f, 1.0f, 3 + 8, null);
+            Assertions.assertEquals(plain, windowed);
+        }
+    }
+
+    @Test
+    public void testSlidingWindowMatchesRecomputeWithTheSamePolicy() {
+        try (NDManager manager = NDManager.newBaseManager()) {
+            BlockStackLM model = model(manager);
+            int[] prompt = {1, 2, 3};
+            List<Integer> windowed = new TextGenerator(model, new Sampler(1))
+                    .generate(manager, prompt, 30, -1, 0.0f, 0, 1.0f, 1.0f, 8, null);
+
+            Assertions.assertEquals(30, windowed.size());
+            Assertions.assertEquals(greedyWithWindowByRecompute(manager, model, prompt, 30, 8), windowed,
+                    "after every context shift the cache must hold exactly what a fresh computation of that context would");
+        }
+    }
+
+    @Test
+    public void testPromptLongerThanTheWindowUsesItsNewestTokens() {
+        try (NDManager manager = NDManager.newBaseManager()) {
+            BlockStackLM model = model(manager);
+            int[] prompt = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 1, 2, 3, 4, 5, 6, 7, 8};
+            List<Integer> windowed = new TextGenerator(model, new Sampler(1))
+                    .generate(manager, prompt, 12, -1, 0.0f, 0, 1.0f, 1.0f, 8, null);
+            Assertions.assertEquals(greedyWithWindowByRecompute(manager, model, prompt, 12, 8), windowed);
+        }
+    }
+
+    @Test
+    public void testListenerSeesEveryTokenInOrder() {
+        try (NDManager manager = NDManager.newBaseManager()) {
+            BlockStackLM model = model(manager);
+            List<Integer> heard = new ArrayList<>();
+            List<Integer> result = new TextGenerator(model, new Sampler(1))
+                    .generate(manager, new int[]{1, 2}, 15, -1, 0.0f, 0, 1.0f, 1.0f, 6, heard::add);
+            Assertions.assertEquals(result, heard);
+        }
+    }
+
+    @Test
+    public void testTooSmallWindowIsRejected() {
+        try (NDManager manager = NDManager.newBaseManager()) {
+            TextGenerator generator = new TextGenerator(model(manager), new Sampler(1));
+            Assertions.assertThrows(IllegalArgumentException.class,
+                    () -> generator.generate(manager, new int[]{1}, 5, -1, 0.0f, 0, 1.0f, 1.0f, 1, null));
+        }
+    }
 }
