@@ -37,7 +37,7 @@ class CausalLossCalculatorTest {
     @DisplayName("Matches a hand-computed cross-entropy")
     void testMatchesHandComputedCrossEntropy() {
         try (NDManager manager = NDManager.newBaseManager()) {
-            NDArray logits = manager.create(new float[][][]{{{1, 2, 3}, {3, 1, 0}}});
+            NDArray logits = manager.create(new float[][]{{1, 2, 3}, {3, 1, 0}}).reshape(1, 2, 3);
             NDArray targets = manager.create(new int[][]{{2, 0}});
             double expected = -(logSoftmax(new double[]{1, 2, 3}, 2) + logSoftmax(new double[]{3, 1, 0}, 0)) / 2;
             assertEquals(expected, CausalLossCalculator.calculateLoss(manager, logits, targets, 99).getFloat(), 1e-5);
@@ -48,7 +48,7 @@ class CausalLossCalculatorTest {
     @DisplayName("Padding positions do not count, and an all-padding batch gives 0 instead of NaN")
     void testPaddingIsIgnored() {
         try (NDManager manager = NDManager.newBaseManager()) {
-            NDArray logits = manager.create(new float[][][]{{{1, 2, 3}, {3, 1, 0}}});
+            NDArray logits = manager.create(new float[][]{{1, 2, 3}, {3, 1, 0}}).reshape(1, 2, 3);
 
             NDArray oneRealToken = manager.create(new int[][]{{2, 0}}); // pad id 0: only position 0 counts
             double expected = -logSoftmax(new double[]{1, 2, 3}, 2);
@@ -63,7 +63,7 @@ class CausalLossCalculatorTest {
     @DisplayName("Gradients reach the logits, and padded positions get none")
     void testGradientFlow() {
         try (NDManager manager = NDManager.newBaseManager()) {
-            NDArray logits = manager.create(new float[][][]{{{1, 2, 3}, {3, 1, 0}}});
+            NDArray logits = manager.create(new float[][]{{1, 2, 3}, {3, 1, 0}}).reshape(1, 2, 3);
             logits.setRequiresGradient(true);
             NDArray targets = manager.create(new int[][]{{2, 0}}); // pad id 0: position 1 is padding
 
