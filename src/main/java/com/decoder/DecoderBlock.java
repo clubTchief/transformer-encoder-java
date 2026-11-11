@@ -45,7 +45,19 @@ public class DecoderBlock {
     private final NDArray wU;
     private final NDArray wD, bD;
 
+    /** Original initialisation (Xavier-style uniform weights), used by the word-level demos. */
     public DecoderBlock(NDManager manager, int dModel, int numHeads, int dFF, float eps) {
+        this(manager, dModel, numHeads, dFF, eps, 0f, 0f);
+    }
+
+    /**
+     * @param weightStd       &gt; 0 selects GPT-style initialisation: every weight matrix is normal(0, weightStd);
+     *                        0 keeps the original Xavier-style uniform initialisation
+     * @param outputWeightStd std of the two matrices that WRITE INTO THE RESIDUAL STREAM (wO and wD). GPT-2 uses
+     *                        weightStd / sqrt(2 * numLayers) so the stream does not grow with depth.
+     */
+    public DecoderBlock(NDManager manager, int dModel, int numHeads, int dFF, float eps,
+                        float weightStd, float outputWeightStd) {
         this.dModel = dModel;
         this.numHeads = numHeads;
         this.headDim = dModel / numHeads;
@@ -54,10 +66,10 @@ public class DecoderBlock {
 
         float scale = (float) Math.sqrt(2.0 / dModel);
 
-        this.wQ = manager.randomUniform(-scale, scale, new Shape(dModel, dModel), DataType.FLOAT32);
-        this.wK = manager.randomUniform(-scale, scale, new Shape(dModel, dModel), DataType.FLOAT32);
-        this.wV = manager.randomUniform(-scale, scale, new Shape(dModel, dModel), DataType.FLOAT32);
-        this.wO = manager.randomUniform(-scale, scale, new Shape(dModel, dModel), DataType.FLOAT32);
+        this.wQ = weight(manager, new Shape(dModel, dModel), weightStd, scale);
+        this.wK = weight(manager, new Shape(dModel, dModel), weightStd, scale);
+        this.wV = weight(manager, new Shape(dModel, dModel), weightStd, scale);
+        this.wO = weight(manager, new Shape(dModel, dModel), outputWeightStd, scale);
 
         this.bQ = manager.zeros(new Shape(dModel), DataType.FLOAT32);
         this.bK = manager.zeros(new Shape(dModel), DataType.FLOAT32);
@@ -68,9 +80,9 @@ public class DecoderBlock {
         this.norm2 = new RMSNorm(manager, dModel, eps);
 
         float ffnScale = (float) Math.sqrt(2.0 / dModel);
-        this.wG = manager.randomUniform(-ffnScale, ffnScale, new Shape(dModel, dFF), DataType.FLOAT32);
-        this.wU = manager.randomUniform(-ffnScale, ffnScale, new Shape(dModel, dFF), DataType.FLOAT32);
-        this.wD = manager.randomUniform(-ffnScale, ffnScale, new Shape(dFF, dModel), DataType.FLOAT32);
+        this.wG = weight(manager, new Shape(dModel, dFF), weightStd, ffnScale);
+        this.wU = weight(manager, new Shape(dModel, dFF), weightStd, ffnScale);
+        this.wD = weight(manager, new Shape(dFF, dModel), outputWeightStd, ffnScale);
         this.bG = manager.zeros(new Shape(dFF), DataType.FLOAT32);
         this.bD = manager.zeros(new Shape(dModel), DataType.FLOAT32);
         for (NDArray p : params()) {
@@ -206,6 +218,18 @@ public class DecoderBlock {
     private static long sequenceLength(NDArray x) {
         Shape s = x.getShape();
         return s.get(s.dimension() - 2);
+    }
+
+    private static NDArray weight(NDManager manager, Shape shape, float std, float uniformScale) {
+        return std > 0f
+                ? manager.randomNormal(0.0f, std, shape, DataType.FLOAT32)
+                : manager.randomUniform(-uniformScale, uniformScale, shape, DataType.FLOAT32);
+    }
+
+    /** One name per entry of {@link #params()}, in the same order (used to say WHICH tensor went wrong). */
+    public List<String> paramNames() {
+        return List.of("wQ", "bQ", "wK", "bK", "wV", "bV", "wO", "bO",
+                "norm1.gamma", "norm2.gamma", "wG", "bG", "wU", "wD", "bD");
     }
 
     public List<NDArray> params() {

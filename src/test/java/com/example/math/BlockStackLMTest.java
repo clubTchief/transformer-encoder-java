@@ -203,4 +203,50 @@ public class BlockStackLMTest {
                     () -> model.forwardWithBuffer(manager, x, null, buffers));
         }
     }
+
+    @Test
+    public void testParamNamesMatchParams() {
+        try (NDManager manager = NDManager.newBaseManager()) {
+            BlockStackLM model = smallModel(manager);
+            List<String> names = model.paramNames();
+            Assertions.assertEquals(model.params().size(), names.size());
+            Assertions.assertEquals("layer0.wQ", names.get(0));
+            Assertions.assertEquals("finalNorm.gamma", names.get(names.size() - 2));
+            Assertions.assertEquals("embedding", names.get(names.size() - 1));
+        }
+    }
+
+    private static double std(NDArray array) {
+        float[] v = array.toFloatArray();
+        double mean = 0;
+        for (float x : v) mean += x;
+        mean /= v.length;
+        double var = 0;
+        for (float x : v) var += (x - mean) * (x - mean);
+        return Math.sqrt(var / v.length);
+    }
+
+    @Test
+    public void testGptStyleInitScalesResidualWritersWithDepth() {
+        try (NDManager manager = NDManager.newBaseManager()) {
+            Engine.getInstance().setRandomSeed(8);
+            BlockStackLM deep = new BlockStackLM(manager, new LMConfig(8, 64, 4, 128, 20, 1e-5f), 0.02f);
+            List<String> names = deep.paramNames();
+            List<NDArray> params = deep.params();
+
+            Assertions.assertEquals(0.02, std(params.get(names.indexOf("layer0.wQ"))), 0.002);
+            // 0.02 / sqrt(2 * 8 layers) = 0.005
+            Assertions.assertEquals(0.005, std(params.get(names.indexOf("layer0.wO"))), 0.0006);
+            Assertions.assertEquals(0.005, std(params.get(names.indexOf("layer7.wD"))), 0.0006);
+        }
+    }
+
+    @Test
+    public void testGptStyleModelProducesFiniteLogits() {
+        try (NDManager manager = NDManager.newBaseManager()) {
+            BlockStackLM model = new BlockStackLM(manager, new LMConfig(4, 32, 2, 64, 15, 1e-5f), 0.02f);
+            float[] logits = model.forwardIds(manager, manager.create(new int[]{1, 2, 3, 4, 5, 6}), causal2D(manager, 6)).toFloatArray();
+            for (float v : logits) Assertions.assertTrue(Float.isFinite(v));
+        }
+    }
 }

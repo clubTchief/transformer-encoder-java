@@ -113,4 +113,29 @@ class AdamOptimizerTest {
             for (float v : vector.toFloatArray()) assertEquals(1.0f, v, 1e-5f);
         }
     }
+
+    @Test
+    @DisplayName("A NaN gradient skips the update instead of turning every weight into NaN")
+    void testNonFiniteGradientIsSkipped() {
+        try (NDManager manager = NDManager.newBaseManager()) {
+            NDArray w = manager.ones(new Shape(3), DataType.FLOAT32);
+            w.setRequiresGradient(true);
+            AdamOptimizer optimizer = new AdamOptimizer(List.of(w), 0.1f);
+
+            try (GradientCollector gc = new GradientEngine(0f).createCollector()) {
+                gc.backward(w.mul(Float.NaN).sum()); // the gradient of this loss is NaN
+            }
+            assertFalse(optimizer.step(0.1f, 0f, 1.0f), "the step must be reported as skipped");
+            assertArrayEquals(new float[]{1f, 1f, 1f}, w.toFloatArray(), 0f);
+            assertEquals(1, optimizer.getSkippedSteps());
+            assertEquals(0, optimizer.getStepCount(), "a skipped step does not count");
+
+            // the NaN gradient was cleared, so the next healthy step works normally
+            backwardOnce(new GradientEngine(0f), w);
+            assertTrue(optimizer.step(0.1f, 0f, 1.0f));
+            for (float v : w.toFloatArray()) {
+                assertTrue(v < 1.0f && Float.isFinite(v), "weights should move after a healthy step, was " + v);
+            }
+        }
+    }
 }

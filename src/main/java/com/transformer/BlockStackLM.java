@@ -26,7 +26,17 @@ public class BlockStackLM {
     private final List<DecoderBlock> layers;
     private final RMSNorm finalNorm;
 
+    /** Legacy initialisation of the blocks (Xavier-style uniform); see the other constructor. */
     public BlockStackLM(NDManager manager, LMConfig config) {
+        this(manager, config, 0f);
+    }
+
+    /**
+     * @param weightStd 0 keeps the legacy initialisation. &gt; 0 selects GPT-style initialisation: normal(0, weightStd) for
+     *                  all weights, and weightStd / sqrt(2 * numLayers) for the matrices that write into the residual
+     *                  stream, so activations stay in range however deep the stack is. 0.02 is the usual value.
+     */
+    public BlockStackLM(NDManager manager, LMConfig config, float weightStd) {
         this.config = config;
 
         this.embedding = manager.randomNormal(0.0f, 0.02f, new Shape(config.vocabSize(), config.dModel()), DataType.FLOAT32);
@@ -34,7 +44,9 @@ public class BlockStackLM {
 
         this.layers = new ArrayList<>(config.numLayers());
         for (int i = 0; i < config.numLayers(); i++) {
-            layers.add(new DecoderBlock(manager, config.dModel(), config.numHeads(), config.dFF(), config.eps()));
+            float outputStd = weightStd > 0f ? weightStd / (float) Math.sqrt(2.0 * config.numLayers()) : 0f;
+            layers.add(new DecoderBlock(manager, config.dModel(), config.numHeads(), config.dFF(), config.eps(),
+                    weightStd, outputStd));
         }
         this.finalNorm = new RMSNorm(manager, config.dModel(), config.eps());
     }
@@ -132,6 +144,19 @@ public class BlockStackLM {
     }
 
     /** All trainable tensors, embedding table last. This is exactly what a checkpoint has to contain. */
+    /** One name per entry of {@link #params()}, in the same order. */
+    public List<String> paramNames() {
+        List<String> names = new ArrayList<>();
+        for (int i = 0; i < layers.size(); i++) {
+            for (String name : layers.get(i).paramNames()) {
+                names.add("layer" + i + "." + name);
+            }
+        }
+        names.add("finalNorm.gamma");
+        names.add("embedding");
+        return names;
+    }
+
     public List<NDArray> params() {
         List<NDArray> params = new ArrayList<>();
         for (DecoderBlock layer : layers) {

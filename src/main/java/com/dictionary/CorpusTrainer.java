@@ -16,9 +16,11 @@ import com.transformer.ModelCheckpoint;
 
 import java.io.IOException;
 import java.io.PrintStream;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Instant;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Random;
 import java.util.Set;
@@ -47,18 +49,20 @@ public final class CorpusTrainer {
 
         public int batchSize = 32;
         public int steps = 5000;
-        public int warmupSteps = -1; // -1: min(200, steps / 10)
+        public int warmupSteps = -1; // -1: max(100, steps / 20), at most half of all steps
         public int evalEvery = 500;
         public int evalBatches = 8;
         public int sampleTokens = 200; // 0 turns the sample text at every evaluation off
-        public float learningRate = 2e-3f;
+        public float learningRate = 1e-3f;
         public float weightDecay = 0.1f;
         public float gradClip = 1.0f;
         public long seed = 1337;
+        public float initStd = 0.02f; // GPT-style initialisation (0 = the legacy Xavier-style one)
+        public int logEvery = 50;     // the first 10 steps are always printed
 
         private static final Set<String> KNOWN = Set.of("corpus", "out", "maxChars", "minFreq", "valFraction", "layers",
                 "dModel", "heads", "dFF", "seqLen", "batch", "steps", "warmup", "evalEvery", "evalBatches", "sampleTokens",
-                "lr", "wd", "clip", "seed");
+                "lr", "wd", "clip", "seed", "init", "logEvery");
 
         public static Settings fromArgs(String[] args) {
             Map<String, String> a = Args.parse(args);
@@ -84,6 +88,8 @@ public final class CorpusTrainer {
             if (a.containsKey("wd")) s.weightDecay = Float.parseFloat(a.get("wd"));
             if (a.containsKey("clip")) s.gradClip = Float.parseFloat(a.get("clip"));
             if (a.containsKey("seed")) s.seed = Long.parseLong(a.get("seed"));
+            if (a.containsKey("init")) s.initStd = Float.parseFloat(a.get("init"));
+            if (a.containsKey("logEvery")) s.logEvery = Integer.parseInt(a.get("logEvery"));
             return s;
         }
     }
@@ -96,14 +102,19 @@ public final class CorpusTrainer {
     }
 
     public static void main(String[] args) throws IOException {
-        Settings settings = Settings.fromArgs(args);
-        if (settings.corpus == null) {
-            throw new IllegalArgumentException("Missing corpus=<text file>. Example: corpus=data/stories.txt");
-        }
-        train(settings, System.out);
+        train(Settings.fromArgs(args), System.out);
     }
 
     public static Result train(Settings s, PrintStream out) throws IOException {
+        if (s.corpus == null) {
+            throw new IllegalArgumentException("Missing corpus=<text file>. Example: corpus=data/stories.txt");
+        }
+        if (!Files.isRegularFile(s.corpus)) {
+            throw new IllegalArgumentException("Corpus file not found: " + s.corpus.toAbsolutePath()
+                    + "\nPaths are relative to the folder you run Maven from. To get TinyStories (Windows cmd):"
+                    + "\n  mkdir data"
+                    + "\n  curl -L -o data\\stories.txt https://huggingface.co/datasets/roneneldan/TinyStories/resolve/main/TinyStoriesV2-GPT4-valid.txt");
+        }
         out.println("Reading " + s.corpus + " ...");
         return train(CharCorpus.load(s.corpus, s.maxChars, s.minCharFreq, s.validationFraction), s, out);
     }
@@ -112,11 +123,14 @@ public final class CorpusTrainer {
         int window = s.seqLen;
         CharTokenizer tokenizer = corpus.tokenizer();
         LMConfig config = new LMConfig(s.numLayers, s.dModel, s.numHeads, s.dFF, tokenizer.vocabSize(), 1e-5f);
-        int warmup = s.warmupSteps >= 0 ? s.warmupSteps : Math.min(200, s.steps / 10);
+        int warmup = s.warmupSteps >= 0 ? s.warmupSteps : Math.min(s.steps / 2, Math.max(100, s.steps / 20));
 
         out.printf("tokens: %d train / %d validation | vocab %d | layers %d, dModel %d, heads %d, dFF %d | window %d, batch %d%n",
                 corpus.trainTokens(), corpus.validationTokens(), tokenizer.vocabSize(),
                 config.numLayers(), config.dModel(), config.numHeads(), config.dFF(), window, s.batchSize);
+        out.printf("lr %.1e (warm-up %d steps, then cosine decay) | weight decay %.2f | gradient clip %.1f | init %s%n",
+                s.learningRate, warmup, s.weightDecay, s.gradClip,
+                s.initStd > 0f ? "GPT-style, std " + s.initStd : "legacy uniform");
         if (!corpus.hasHeldOutValidation(window)) {
             out.println("note: no held-out text for validation (corpus too small), so the validation loss is measured on training text");
         }
@@ -131,7 +145,7 @@ public final class CorpusTrainer {
 
         try (NDManager manager = NDManager.newBaseManager()) {
             Engine.getInstance().setRandomSeed((int) s.seed);
-            BlockStackLM model = new BlockStackLM(manager, config);
+            BlockStackLM model = new BlockStackLM(manager, config, s.initStd);
             AdamOptimizer optimizer = new AdamOptimizer(model.params(), s.learningRate, 0.9f, 0.95f, 1e-8f);
             NDArray mask = CausalMaskGenerator.createCausalMask(manager, window).squeeze(0).squeeze(0);
 
@@ -140,6 +154,7 @@ public final class CorpusTrainer {
                 float lr = lrAt(step, s.steps, s.learningRate, warmup);
 
                 float loss;
+                boolean applied = true;
                 try (NDManager scope = manager.newSubManager()) {
                     NDArray inputIds = scope.create(inputs);
                     NDArray targetIds = scope.create(targets);
@@ -149,18 +164,33 @@ public final class CorpusTrainer {
                         gc.backward(lossTensor);
                         loss = lossTensor.getFloat();
                     }
-                    optimizer.step(lr, s.weightDecay, s.gradClip); // collector closed: gradient mode is off
+                    if (Float.isFinite(loss)) {
+                        applied = optimizer.step(lr, s.weightDecay, s.gradClip); // collector closed: gradient mode is off
+                    }
                 }
 
                 if (!Float.isFinite(loss)) {
-                    throw new IllegalStateException("The loss became " + loss + " at step " + step + ". Lower the learning rate (lr=...).");
+                    // No update was applied for this batch, so the weights below are exactly what produced the bad loss.
+                    throw new IllegalStateException("The loss became " + loss + " at step " + step + " (lr " + lr + ").\n"
+                            + "Losses of the previous steps: " + recent(losses, step - 1) + "\n"
+                            + "Tensors with non-finite values:\n" + diagnose(model)
+                            + "Try a smaller lr=..., or rerun with logEvery=1 to watch the first steps.");
                 }
+                if (!applied) {
+                    out.printf("step %6d | gradient norm is %s: update skipped (%d skipped so far)%n",
+                            step, optimizer.getLastGradNorm(), optimizer.getSkippedSteps());
+                    if (optimizer.getSkippedSteps() > 10) {
+                        throw new IllegalStateException("More than 10 steps had a non-finite gradient; training is not stable.\n"
+                                + "Tensors with non-finite values:\n" + diagnose(model) + "Try a smaller lr=....");
+                    }
+                }
+
                 losses[step - 1] = loss;
                 windowSum += loss;
                 windowCount++;
-                if (step % 50 == 0) {
+                if (step <= 10 || step % s.logEvery == 0) {
                     out.printf("step %6d | train loss %.4f | lr %.2e | grad norm %.2f%n",
-                            step, windowSum / windowCount, lr, optimizer.getLastGradNorm());
+                            step, step <= 10 ? loss : windowSum / windowCount, lr, optimizer.getLastGradNorm());
                     windowSum = 0;
                     windowCount = 0;
                 }
@@ -179,6 +209,48 @@ public final class CorpusTrainer {
 
         int edge = Math.min(10, s.steps);
         return new Result(mean(losses, 0, edge), mean(losses, s.steps - edge, s.steps), validationLoss, s.steps);
+    }
+
+    /** The last few recorded losses, for the error message. */
+    private static String recent(float[] losses, int recorded) {
+        StringBuilder text = new StringBuilder("[");
+        for (int i = Math.max(0, recorded - 10); i < recorded; i++) {
+            text.append(String.format("%.3f", losses[i])).append(i < recorded - 1 ? ", " : "");
+        }
+        return text.append("]").toString();
+    }
+
+    /** Names the tensors whose weights or gradients are NaN or Infinity (empty list: the forward pass overflowed). */
+    private static String diagnose(BlockStackLM model) {
+        List<NDArray> params = model.params();
+        List<String> names = model.paramNames();
+        StringBuilder report = new StringBuilder();
+        for (int i = 0; i < params.size(); i++) {
+            boolean badWeights = hasNonFinite(params.get(i));
+            boolean badGradient = false;
+            try {
+                badGradient = hasNonFinite(params.get(i).getGradient());
+            } catch (RuntimeException noGradientYet) {
+                // nothing to inspect
+            }
+            if (badWeights || badGradient) {
+                report.append(String.format("  %-18s %s  weights: %s, gradient: %s%n", names.get(i), params.get(i).getShape(),
+                        badWeights ? "NON-FINITE" : "ok", badGradient ? "NON-FINITE" : "ok"));
+            }
+        }
+        if (report.length() == 0) {
+            report.append("  none: all weights and gradients are finite, so the overflow happened inside the forward pass of this batch\n");
+        }
+        return report.toString();
+    }
+
+    private static boolean hasNonFinite(NDArray array) {
+        for (float value : array.toFloatArray()) {
+            if (!Float.isFinite(value)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     static float lrAt(int step, int total, float max, int warmup) {

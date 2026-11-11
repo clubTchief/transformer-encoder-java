@@ -8,7 +8,8 @@ import java.util.List;
 
 /**
  * Adam / AdamW. {@link #step(float, float, float)} adds what real training needs on top of plain Adam: a learning
- * rate per step (warm-up and decay schedules), decoupled weight decay for matrices and global gradient-norm clipping.
+ * rate per step (warm-up and decay schedules), decoupled weight decay for matrices, global gradient-norm clipping and
+ * protection against non-finite gradients.
  * All temporaries of a step live in a short-lived sub-manager, so thousands of steps do not pile up native memory.
  * Call step() OUTSIDE the GradientCollector block. It also resets the gradients, because backward() ADDS to them.
  */
@@ -24,6 +25,7 @@ public class AdamOptimizer {
     private final List<NDArray> v;
     private int t;
     private float lastGradNorm;
+    private int skippedSteps;
 
     public AdamOptimizer(List<NDArray> params, float lr, float beta1, float beta2, float eps) {
         this.params = params;
@@ -55,15 +57,14 @@ public class AdamOptimizer {
     /**
      * @param learningRate learning rate for THIS step
      * @param weightDecay  decoupled weight decay (AdamW), applied to matrices only; 0 disables
-     * @param maxGradNorm  clip the global gradient norm to this value; 0 or less disables
+     * @param maxGradNorm  clip the global gradient norm to this value; 0 or less disables clipping
+     * @return false if the gradient contained NaN or Infinity: the step was SKIPPED (weights untouched, gradients
+     *         cleared), because applying it would turn every weight into NaN. True if the update was applied.
      */
-    public void step(float learningRate, float weightDecay, float maxGradNorm) {
+    public boolean step(float learningRate, float weightDecay, float maxGradNorm) {
         if (params.isEmpty()) {
-            return;
+            return true;
         }
-        t++;
-        float biasCorrection1 = 1.0f - (float) Math.pow(beta1, t);
-        float biasCorrection2 = 1.0f - (float) Math.pow(beta2, t);
 
         try (NDManager tmp = params.get(0).getManager().newSubManager()) {
             int n = params.size();
@@ -76,19 +77,26 @@ public class AdamOptimizer {
                 }
                 grad.attach(tmp);
                 grads[i] = grad;
-                if (maxGradNorm > 0f) {
-                    sumSquares += grad.square().sum().getFloat();
+                sumSquares += grad.square().sum().getFloat();
+            }
+            double norm = Math.sqrt(sumSquares);
+            lastGradNorm = (float) norm;
+
+            if (!Double.isFinite(norm)) {
+                // NaN * 0 is still NaN, so the gradients have to be overwritten, not multiplied by zero
+                for (NDArray grad : grads) {
+                    if (grad != null) {
+                        grad.set(new float[(int) grad.size()]);
+                    }
                 }
+                skippedSteps++;
+                return false;
             }
 
-            float clipScale = 1f;
-            if (maxGradNorm > 0f) {
-                double norm = Math.sqrt(sumSquares);
-                lastGradNorm = (float) norm;
-                if (norm > maxGradNorm) {
-                    clipScale = (float) (maxGradNorm / (norm + 1e-6));
-                }
-            }
+            t++;
+            float biasCorrection1 = 1.0f - (float) Math.pow(beta1, t);
+            float biasCorrection2 = 1.0f - (float) Math.pow(beta2, t);
+            float clipScale = (maxGradNorm > 0f && norm > maxGradNorm) ? (float) (maxGradNorm / (norm + 1e-6)) : 1f;
 
             for (int i = 0; i < n; i++) {
                 if (grads[i] == null) {
@@ -119,14 +127,21 @@ public class AdamOptimizer {
                 grads[i].muli(0f);
             }
         }
+        return true;
     }
 
-    /** Global gradient norm measured (before clipping) in the last step() that had clipping enabled. */
+    /** Global gradient norm of the last step(), measured before clipping. */
     public float getLastGradNorm() {
         return lastGradNorm;
     }
 
+    /** Number of updates actually applied (skipped steps do not count). */
     public int getStepCount() {
         return t;
+    }
+
+    /** Steps that were skipped because the gradient was NaN or Infinity. */
+    public int getSkippedSteps() {
+        return skippedSteps;
     }
 }

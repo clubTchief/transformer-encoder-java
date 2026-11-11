@@ -28,7 +28,9 @@ saves `models/tinystories.ckpt` each time (the file is replaced atomically, so y
 | `steps` | 5000 | optimizer steps |
 | `batch`, `seqLen` | 32, 128 | windows per step, characters per window (= context the model is trained on) |
 | `layers`, `dModel`, `heads`, `dFF` | 4, 128, 4, 352 | architecture |
-| `lr`, `wd`, `clip`, `warmup` | 2e-3, 0.1, 1.0, auto | peak learning rate (cosine decay), weight decay, gradient-norm clip, warm-up steps |
+| `lr`, `wd`, `clip`, `warmup` | 1e-3, 0.1, 1.0, auto | peak learning rate (cosine decay), weight decay, gradient-norm clip, warm-up steps (auto: max(100, steps/20)) |
+| `init` | 0.02 | GPT-style initialisation: normal(0, init) weights, and init / sqrt(2 * layers) for the matrices that write into the residual stream; `init=0` selects the legacy uniform initialisation |
+| `logEvery` | 50 | print the average loss every N steps (the first 10 steps are always printed one by one) |
 | `evalEvery`, `evalBatches`, `sampleTokens` | 500, 8, 200 | evaluation cadence and sample length (0 = no sample) |
 | `maxChars`, `minFreq`, `valFraction`, `seed` | 20000000, 50, 0.01, 1337 | how much text to read, rare characters become `?`, validation share, RNG seed |
 
@@ -49,3 +51,13 @@ position 0, so a story can be longer than `seqLen` without leaving the positions
 `StoryGeneratorCLI` and `MultiBatchTrainer` use a closed word vocabulary built from four hard-coded sentences, so
 they cannot even read "galaxy". The character model has no unknown words, trains on random windows of the whole corpus
 (not fixed chunks that cut sentences apart), and its checkpoint cannot drift from the code that reads it.
+
+## If training reports `The loss became NaN`
+The trainer never applies an update after a non-finite loss, and it skips (and counts) steps whose gradient is NaN or
+Infinity instead of letting them turn every weight into NaN. When it does stop, the message lists the last losses and
+the tensors (`layer2.wG`, `embedding`, ...) whose weights or gradient are not finite. "All weights and gradients are
+finite" means the overflow happened inside the forward pass of that batch. Things to try, in this order:
+1. a smaller learning rate, e.g. `lr=5e-4`;
+2. a longer warm-up, e.g. `warmup=300`;
+3. `logEvery=1` to see the loss and the gradient norm at every step (a norm that keeps growing is the warning sign).
+Please keep the printed message when reporting a problem; it says where the numbers went wrong.

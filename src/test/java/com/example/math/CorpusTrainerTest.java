@@ -93,5 +93,26 @@ class CorpusTrainerTest {
         assertEquals(10, s.steps);
         assertEquals(0.01f, s.learningRate, 1e-9f);
         assertEquals(Path.of("m.ckpt"), s.checkpoint);
+
+        CorpusTrainer.Settings t = CorpusTrainer.Settings.fromArgs(new String[]{"corpus=x.txt", "init=0.05", "logEvery=10"});
+        assertEquals(0.05f, t.initStd, 1e-9f);
+        assertEquals(10, t.logEvery);
+        assertEquals(0.02f, CorpusTrainer.Settings.fromArgs(new String[]{"corpus=x.txt"}).initStd, 1e-9f, "GPT-style init is the default");
+    }
+
+    @Test
+    @DisplayName("A missing corpus file produces a message that says where it looked and how to get one")
+    void testMissingCorpusFileIsExplained(@TempDir Path dir) {
+        CorpusTrainer.Settings settings = tinySettings(dir.resolve("never.ckpt"));
+        settings.corpus = dir.resolve("no-such-file.txt");
+
+        IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
+                () -> CorpusTrainer.train(settings, new PrintStream(OutputStream.nullOutputStream())));
+        assertTrue(e.getMessage().contains("no-such-file.txt"), e.getMessage());
+        assertTrue(e.getMessage().contains("curl"), "the message should say how to download TinyStories: " + e.getMessage());
+
+        settings.corpus = null;
+        assertThrows(IllegalArgumentException.class,
+                () -> CorpusTrainer.train(settings, new PrintStream(OutputStream.nullOutputStream())));
     }
 }

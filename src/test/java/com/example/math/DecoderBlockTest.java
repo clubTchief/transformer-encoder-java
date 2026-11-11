@@ -305,4 +305,48 @@ class DecoderBlockTest {
         float[] idB = lastRow(block.forward(manager.create(b), mask, identityCos, identitySin), n, d);
         assertTrue(maxAbsDiff(idA, idB) < 1e-4f, "without RoPE the order of earlier tokens cannot matter here");
     }
+
+    private static double std(NDArray array) {
+        float[] v = array.toFloatArray();
+        double mean = 0;
+        for (float x : v) mean += x;
+        mean /= v.length;
+        double var = 0;
+        for (float x : v) var += (x - mean) * (x - mean);
+        return Math.sqrt(var / v.length);
+    }
+
+    @Test
+    @DisplayName("paramNames() describes params() one to one")
+    void testParamNamesMatchParams() {
+        DecoderBlock block = new DecoderBlock(manager, 16, 2, 32, 1e-5f);
+        assertEquals(block.params().size(), block.paramNames().size());
+        assertEquals("wO", block.paramNames().get(6));
+        assertEquals(java.util.Set.copyOf(block.paramNames()).size(), block.paramNames().size(), "names are unique");
+    }
+
+    @Test
+    @DisplayName("GPT-style initialisation: normal weights, a smaller std for the residual-stream writers, zero biases")
+    void testGptStyleInitialisation() {
+        Engine.getInstance().setRandomSeed(21);
+        DecoderBlock gpt = new DecoderBlock(manager, 64, 4, 128, 1e-5f, 0.02f, 0.005f);
+        java.util.List<NDArray> p = gpt.params();
+        java.util.List<String> names = gpt.paramNames();
+
+        assertEquals(0.02, std(p.get(names.indexOf("wQ"))), 0.002);
+        assertEquals(0.02, std(p.get(names.indexOf("wG"))), 0.002);
+        assertEquals(0.005, std(p.get(names.indexOf("wO"))), 0.0005);
+        assertEquals(0.005, std(p.get(names.indexOf("wD"))), 0.0005);
+        assertEquals(0.0, p.get(names.indexOf("bQ")).abs().sum().getFloat(), 0.0, "biases start at zero");
+    }
+
+    @Test
+    @DisplayName("The original constructor keeps its Xavier-style uniform initialisation")
+    void testLegacyInitialisationIsUnchanged() {
+        DecoderBlock legacy = new DecoderBlock(manager, 64, 4, 128, 1e-5f);
+        NDArray wQ = legacy.params().get(legacy.paramNames().indexOf("wQ"));
+        float bound = (float) Math.sqrt(2.0 / 64);
+        assertTrue(wQ.abs().max().getFloat() <= bound + 1e-6f, "uniform in [-sqrt(2/d), sqrt(2/d)]");
+        assertTrue(wQ.abs().max().getFloat() > 0.8f * bound, "and actually spread over that range");
+    }
 }
