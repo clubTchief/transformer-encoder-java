@@ -3,7 +3,10 @@ package com.example.math;
 import ai.djl.engine.Engine;
 import ai.djl.ndarray.NDArray;
 import ai.djl.ndarray.NDManager;
+import com.dictionary.TokenizerFactory;
 import com.example.story.CharTokenizer;
+import com.tokenizer.BpeTrainer;
+import com.tokenizer.Tokenizer;
 import com.transformer.BlockStackLM;
 import com.transformer.CausalMaskGenerator;
 import com.transformer.LMConfig;
@@ -13,6 +16,8 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.io.BufferedOutputStream;
+import java.io.DataOutputStream;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -121,6 +126,96 @@ class ModelCheckpointTest {
         try (NDManager manager = NDManager.newBaseManager()) {
             assertThrows(IllegalArgumentException.class,
                     () -> ModelCheckpoint.save(dir.resolve("x.ckpt"), model(manager), new char[]{'a', 'b'}, meta()));
+        }
+    }
+
+    // ------------------------------------------------------------------ tokenizer kinds and the old format
+
+    @Test
+    @DisplayName("A BPE tokenizer is stored in the checkpoint and comes back with the same behaviour")
+    void testBpeTokenizerRoundTrip(@TempDir Path dir) throws IOException {
+        String text = "the cat sat on the mat. the dog sat on the log.<|endoftext|>".repeat(40);
+        Tokenizer bpe = BpeTrainer.train(text, 300, null);
+        try (NDManager manager = NDManager.newBaseManager()) {
+            Engine.getInstance().setRandomSeed(3);
+            BlockStackLM model = new BlockStackLM(manager, new LMConfig(2, 16, 2, 32, bpe.vocabSize(), 1e-5f));
+            Path file = dir.resolve("bpe.ckpt");
+            ModelCheckpoint.save(file, model, bpe, meta());
+
+            ModelCheckpoint.Loaded loaded = ModelCheckpoint.load(manager, file);
+            assertEquals("bpe", loaded.tokenizerKind());
+            Tokenizer restored = TokenizerFactory.load(loaded);
+            assertEquals(bpe.vocabSize(), restored.vocabSize());
+            assertArrayEquals(bpe.encode(text), restored.encode(text));
+            assertThrows(IllegalStateException.class, loaded::vocabulary, "a BPE checkpoint has no character vocabulary");
+        }
+    }
+
+    @Test
+    @DisplayName("A tokenizer whose size does not match the model is refused when saving")
+    void testTokenizerSizeIsChecked(@TempDir Path dir) {
+        Tokenizer bpe = BpeTrainer.train("the cat sat on the mat. ".repeat(50), 300, null);
+        try (NDManager manager = NDManager.newBaseManager()) {
+            BlockStackLM model = new BlockStackLM(manager, new LMConfig(1, 16, 2, 32, bpe.vocabSize() + 1, 1e-5f));
+            assertThrows(IllegalArgumentException.class, () -> ModelCheckpoint.save(dir.resolve("x.ckpt"), model, bpe, meta()));
+        }
+    }
+
+    /** Writes the format of version 1, which stored a bare character vocabulary: what the first corpus trainer produced. */
+    private static void writeVersion1(Path file, BlockStackLM model, char[] vocabulary, Map<String, String> meta) throws IOException {
+        try (DataOutputStream out = new DataOutputStream(new BufferedOutputStream(Files.newOutputStream(file)))) {
+            LMConfig c = model.getConfig();
+            out.writeInt(ModelCheckpoint.MAGIC);
+            out.writeInt(1);
+            out.writeInt(c.numLayers());
+            out.writeInt(c.dModel());
+            out.writeInt(c.numHeads());
+            out.writeInt(c.dFF());
+            out.writeInt(c.vocabSize());
+            out.writeFloat(c.eps());
+            out.writeInt(vocabulary.length);
+            for (char ch : vocabulary) out.writeChar(ch);
+            out.writeInt(meta.size());
+            for (Map.Entry<String, String> e : meta.entrySet()) {
+                out.writeUTF(e.getKey());
+                out.writeUTF(e.getValue());
+            }
+            ModelSerializer.writeTensors(out, model.params());
+        }
+    }
+
+    @Test
+    @DisplayName("Checkpoints written before BPE existed (version 1) still load, as character-tokenizer checkpoints")
+    void testVersion1CheckpointsStillLoad(@TempDir Path dir) throws IOException {
+        try (NDManager manager = NDManager.newBaseManager()) {
+            BlockStackLM original = model(manager);
+            Path file = dir.resolve("old.ckpt");
+            writeVersion1(file, original, TOKENIZER.chars(), meta());
+
+            assertTrue(ModelCheckpoint.isCheckpoint(file));
+            ModelCheckpoint.Loaded loaded = ModelCheckpoint.load(manager, file);
+
+            assertEquals("char", loaded.tokenizerKind());
+            assertArrayEquals(TOKENIZER.chars(), loaded.vocabulary());
+            assertEquals(meta(), loaded.metadata());
+            assertArrayEquals(logits(manager, original), logits(manager, loaded.model()), 1e-6f);
+
+            Tokenizer restored = TokenizerFactory.load(loaded);
+            assertArrayEquals(TOKENIZER.encode("abc xyz"), restored.encode("abc xyz"));
+        }
+    }
+
+    @Test
+    @DisplayName("A future checkpoint version is refused with a clear message")
+    void testFutureVersionIsRefused(@TempDir Path dir) throws IOException {
+        Path file = dir.resolve("future.ckpt");
+        try (DataOutputStream out = new DataOutputStream(Files.newOutputStream(file))) {
+            out.writeInt(ModelCheckpoint.MAGIC);
+            out.writeInt(99);
+        }
+        try (NDManager manager = NDManager.newBaseManager()) {
+            IOException e = assertThrows(IOException.class, () -> ModelCheckpoint.load(manager, file));
+            assertTrue(e.getMessage().contains("version"), e.getMessage());
         }
     }
 }

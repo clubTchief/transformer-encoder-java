@@ -1,6 +1,13 @@
 package com.example.story;
 
+import com.tokenizer.Tokenizer;
+
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.HashMap;
@@ -12,7 +19,7 @@ import java.util.Map;
  * matrix tiny and needs no tokenizer training. Id 0 = end-of-story, id 1 = unknown.
  * Upgrade path: swap in a small BPE (the HF tokenizers dependency is already in the pom).
  */
-public final class CharTokenizer {
+public final class CharTokenizer implements Tokenizer {
     public static final int EOS = 0;
     public static final int UNK = 1;
     private static final char EOS_CHAR = '\u0003';
@@ -42,6 +49,74 @@ public final class CharTokenizer {
 
     public int vocabSize() {
         return idToChar.length;
+    }
+
+    @Override
+    public String kind() {
+        return "char";
+    }
+
+    @Override
+    public int eosId() {
+        return EOS;
+    }
+
+    @Override
+    public int unkId() {
+        return UNK;
+    }
+
+    @Override
+    public String decode(int[] ids) {
+        StringBuilder text = new StringBuilder();
+        for (int id : ids) {
+            text.append(id == EOS ? END_OF_TEXT : decodeToken(id));
+        }
+        return text.toString();
+    }
+
+    /** The vocabulary as UTF-16 characters, two bytes each. */
+    @Override
+    public byte[] serialize() {
+        ByteArrayOutputStream buffer = new ByteArrayOutputStream();
+        try (DataOutputStream out = new DataOutputStream(buffer)) {
+            for (char c : idToChar) {
+                out.writeChar(c);
+            }
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+        return buffer.toByteArray();
+    }
+
+    public static CharTokenizer deserialize(byte[] data) {
+        if (data.length % 2 != 0) {
+            throw new IllegalArgumentException("Damaged character vocabulary: odd number of bytes");
+        }
+        char[] chars = new char[data.length / 2];
+        try (DataInputStream in = new DataInputStream(new ByteArrayInputStream(data))) {
+            for (int i = 0; i < chars.length; i++) {
+                chars[i] = in.readChar();
+            }
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+        return fromChars(chars);
+    }
+
+    @Override
+    public StreamDecoder newStreamDecoder() {
+        return new StreamDecoder() {
+            @Override
+            public String accept(int id) {
+                return decodeToken(id);
+            }
+
+            @Override
+            public String finish() {
+                return "";
+            }
+        };
     }
 
     /** The vocabulary, id = position (a copy). Store it in a checkpoint to rebuild this tokenizer later. */

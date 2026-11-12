@@ -5,6 +5,8 @@ import ai.djl.ndarray.NDArray;
 import ai.djl.ndarray.NDManager;
 import ai.djl.training.GradientCollector;
 import com.example.story.CharTokenizer;
+import com.tokenizer.BpeTrainer;
+import com.tokenizer.Tokenizer;
 import com.generation.Sampler;
 import com.generation.TextGenerator;
 import com.transformer.AdamOptimizer;
@@ -26,7 +28,7 @@ import java.util.Random;
 import java.util.Set;
 
 /**
- * Trains the repo's own decoder stack (BlockStackLM) on a text file, character by character, and writes a
+ * Trains the repo's own decoder stack (BlockStackLM) on a text file, token by token (a character or a byte-level BPE tokenizer), and writes a
  * self-describing checkpoint that CorpusGeneratorCLI can use without knowing anything about the training run.
  *
  * mvn -q compile exec:java -Dexec.mainClass=com.dictionary.CorpusTrainer -Dexec.args="corpus=data/stories.txt steps=3000"
@@ -38,7 +40,10 @@ public final class CorpusTrainer {
         public Path corpus;
         public Path checkpoint = Path.of("models/tinystories.ckpt");
         public int maxChars = 20_000_000;
-        public int minCharFreq = 50;
+        public String tokenizer = "bpe";   // "bpe" or "char"
+        public int bpeVocab = 2048;        // vocabulary size of the BPE tokenizer (257 base tokens + merges)
+        public Path tokenizerFile;         // if set: loaded when it exists, otherwise the new tokenizer is saved there
+        public int minCharFreq = 50;       // "char" only: rarer characters become the unknown token
         public double validationFraction = 0.01;
 
         public int numLayers = 4;
@@ -62,7 +67,7 @@ public final class CorpusTrainer {
 
         private static final Set<String> KNOWN = Set.of("corpus", "out", "maxChars", "minFreq", "valFraction", "layers",
                 "dModel", "heads", "dFF", "seqLen", "batch", "steps", "warmup", "evalEvery", "evalBatches", "sampleTokens",
-                "lr", "wd", "clip", "seed", "init", "logEvery");
+                "lr", "wd", "clip", "seed", "init", "logEvery", "tokenizer", "bpeVocab", "tokenizerFile");
 
         public static Settings fromArgs(String[] args) {
             Map<String, String> a = Args.parse(args);
@@ -90,6 +95,9 @@ public final class CorpusTrainer {
             if (a.containsKey("seed")) s.seed = Long.parseLong(a.get("seed"));
             if (a.containsKey("init")) s.initStd = Float.parseFloat(a.get("init"));
             if (a.containsKey("logEvery")) s.logEvery = Integer.parseInt(a.get("logEvery"));
+            if (a.containsKey("tokenizer")) s.tokenizer = a.get("tokenizer");
+            if (a.containsKey("bpeVocab")) s.bpeVocab = Integer.parseInt(a.get("bpeVocab"));
+            if (a.containsKey("tokenizerFile")) s.tokenizerFile = Path.of(a.get("tokenizerFile"));
             return s;
         }
     }
@@ -116,17 +124,48 @@ public final class CorpusTrainer {
                     + "\n  curl -L -o data\\stories.txt https://huggingface.co/datasets/roneneldan/TinyStories/resolve/main/TinyStoriesV2-GPT4-valid.txt");
         }
         out.println("Reading " + s.corpus + " ...");
-        return train(CharCorpus.load(s.corpus, s.maxChars, s.minCharFreq, s.validationFraction), s, out);
+        String text = TokenCorpus.readText(s.corpus, s.maxChars);
+        Tokenizer tokenizer = prepareTokenizer(s, text, out);
+        out.println("Tokenizing " + text.length() + " characters ...");
+        return train(TokenCorpus.fromText(text, tokenizer, s.validationFraction), s, out);
     }
 
-    public static Result train(CharCorpus corpus, Settings s, PrintStream out) throws IOException {
+    /** The tokenizer from the tokenizer file if there is one, otherwise a newly trained one (saved if a file is named). */
+    static Tokenizer prepareTokenizer(Settings s, String text, PrintStream out) throws IOException {
+        if (s.tokenizerFile != null && Files.isRegularFile(s.tokenizerFile)) {
+            Tokenizer loaded = TokenizerFactory.load(s.tokenizerFile);
+            out.println("Using the " + loaded.kind() + " tokenizer from " + s.tokenizerFile + " (" + loaded.vocabSize() + " tokens)");
+            return loaded;
+        }
+
+        Tokenizer tokenizer;
+        if ("char".equals(s.tokenizer)) {
+            tokenizer = CharTokenizer.fromText(text, s.minCharFreq);
+            out.println("Character tokenizer: " + tokenizer.vocabSize() + " tokens");
+        } else if ("bpe".equals(s.tokenizer)) {
+            out.println("Learning " + (s.bpeVocab - 257) + " BPE merges (vocabulary " + s.bpeVocab + ") ...");
+            long start = System.nanoTime();
+            tokenizer = BpeTrainer.train(text, s.bpeVocab,
+                    (done, total, count) -> out.printf("  merge %d / %d (the last pair occurred %d times)%n", done, total, count));
+            out.printf("BPE tokenizer: %d tokens, learned in %.1f s%n", tokenizer.vocabSize(), (System.nanoTime() - start) / 1e9);
+        } else {
+            throw new IllegalArgumentException("Unknown tokenizer '" + s.tokenizer + "' (use bpe or char)");
+        }
+        if (s.tokenizerFile != null) {
+            TokenizerFactory.save(s.tokenizerFile, tokenizer);
+            out.println("Saved the tokenizer to " + s.tokenizerFile);
+        }
+        return tokenizer;
+    }
+
+    public static Result train(TokenCorpus corpus, Settings s, PrintStream out) throws IOException {
         int window = s.seqLen;
-        CharTokenizer tokenizer = corpus.tokenizer();
+        Tokenizer tokenizer = corpus.tokenizer();
         LMConfig config = new LMConfig(s.numLayers, s.dModel, s.numHeads, s.dFF, tokenizer.vocabSize(), 1e-5f);
         int warmup = s.warmupSteps >= 0 ? s.warmupSteps : Math.min(s.steps / 2, Math.max(100, s.steps / 20));
 
-        out.printf("tokens: %d train / %d validation | vocab %d | layers %d, dModel %d, heads %d, dFF %d | window %d, batch %d%n",
-                corpus.trainTokens(), corpus.validationTokens(), tokenizer.vocabSize(),
+        out.printf("tokens: %d train / %d validation (%.2f characters per token) | vocab %d | layers %d, dModel %d, heads %d, dFF %d | window %d, batch %d%n",
+                corpus.trainTokens(), corpus.validationTokens(), corpus.charsPerToken(), tokenizer.vocabSize(),
                 config.numLayers(), config.dModel(), config.numHeads(), config.dFF(), window, s.batchSize);
         out.printf("lr %.1e (warm-up %d steps, then cosine decay) | weight decay %.2f | gradient clip %.1f | init %s%n",
                 s.learningRate, warmup, s.weightDecay, s.gradClip,
@@ -202,7 +241,7 @@ public final class CorpusTrainer {
                         out.println(sample(manager, model, tokenizer, window, s.sampleTokens, step));
                         out.println("----");
                     }
-                    ModelCheckpoint.save(s.checkpoint, model, tokenizer.chars(), metadata(s, step, validationLoss));
+                    ModelCheckpoint.save(s.checkpoint, model, tokenizer, metadata(s, tokenizer, step, validationLoss));
                 }
             }
         }
@@ -261,7 +300,7 @@ public final class CorpusTrainer {
         return (float) (0.1 * max + 0.9 * max * 0.5 * (1 + Math.cos(Math.PI * progress)));
     }
 
-    private static float validationLoss(NDManager manager, BlockStackLM model, CharCorpus corpus, NDArray mask,
+    private static float validationLoss(NDManager manager, BlockStackLM model, TokenCorpus corpus, NDArray mask,
                                         int batchSize, int window, int batches) {
         Random rng = new Random(12345); // the same windows at every evaluation, so the numbers can be compared
         int[][] inputs = new int[batchSize][window];
@@ -277,16 +316,18 @@ public final class CorpusTrainer {
         return (float) (total / batches);
     }
 
-    private static String sample(NDManager manager, BlockStackLM model, CharTokenizer tokenizer, int window, int tokens, long seed) {
+    private static String sample(NDManager manager, BlockStackLM model, Tokenizer tokenizer, int window, int tokens, long seed) {
         StringBuilder text = new StringBuilder();
-        new TextGenerator(model, new Sampler(seed)).generate(manager, new int[]{CharTokenizer.EOS}, tokens,
-                CharTokenizer.EOS, 0.8f, 40, 0.95f, 1.0f, window, id -> text.append(tokenizer.decodeToken(id)));
-        return text.toString();
+        Tokenizer.StreamDecoder decoder = tokenizer.newStreamDecoder();
+        new TextGenerator(model, new Sampler(seed)).generate(manager, new int[]{tokenizer.eosId()}, tokens,
+                tokenizer.eosId(), 0.8f, 40, 0.95f, 1.0f, window, id -> text.append(decoder.accept(id)));
+        return text.append(decoder.finish()).toString();
     }
 
-    private static Map<String, String> metadata(Settings s, int step, float validationLoss) {
+    private static Map<String, String> metadata(Settings s, Tokenizer tokenizer, int step, float validationLoss) {
         Map<String, String> meta = new LinkedHashMap<>();
         meta.put("seqLen", String.valueOf(s.seqLen));
+        meta.put("tokenizer", tokenizer.kind());
         meta.put("steps", String.valueOf(step));
         meta.put("validationLoss", String.valueOf(validationLoss));
         meta.put("corpus", s.corpus == null ? "(in memory)" : s.corpus.toString());

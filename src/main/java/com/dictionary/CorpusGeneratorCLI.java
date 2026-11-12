@@ -1,7 +1,7 @@
 package com.dictionary;
 
 import ai.djl.ndarray.NDManager;
-import com.example.story.CharTokenizer;
+import com.tokenizer.Tokenizer;
 import com.generation.Sampler;
 import com.generation.TextGenerator;
 import com.transformer.ModelCheckpoint;
@@ -50,10 +50,10 @@ public final class CorpusGeneratorCLI {
 
         try (NDManager manager = NDManager.newBaseManager()) {
             ModelCheckpoint.Loaded loaded = ModelCheckpoint.load(manager, path);
-            CharTokenizer tokenizer = CharTokenizer.fromChars(loaded.vocabulary());
+            Tokenizer tokenizer = TokenizerFactory.load(loaded);
             int window = Integer.parseInt(loaded.metadata().getOrDefault("seqLen", "128"));
 
-            System.out.println("Loaded " + path + ": " + loaded.model().getConfig() + ", window " + window
+            System.out.println("Loaded " + path + ": " + loaded.model().getConfig() + ", " + tokenizer.kind() + " tokenizer, window " + window
                     + ", trained " + loaded.metadata().getOrDefault("steps", "?") + " steps"
                     + ", validation loss " + loaded.metadata().getOrDefault("validationLoss", "?"));
 
@@ -89,40 +89,51 @@ public final class CorpusGeneratorCLI {
 
     /**
      * Continues {@code prompt}. Generation starts after an end-of-text token, like every story in the training text,
-     * stops when the model emits another one or after {@code maxTokens} characters, and slides its context window so
-     * it can run longer than the window the model was trained on.
+     * stops when the model emits another one or after {@code maxTokens} tokens, and slides its context window so it
+     * can run longer than the window the model was trained on.
      *
-     * @param sink receives the prompt first and then every generated piece as soon as it exists
+     * @param sink receives the prompt first and then every generated piece of text as soon as it is complete
      * @return the prompt plus the generated text
      */
-    public static String complete(NDManager manager, ModelCheckpoint.Loaded loaded, CharTokenizer tokenizer, int window,
+    public static String complete(NDManager manager, ModelCheckpoint.Loaded loaded, Tokenizer tokenizer, int window,
                                   String prompt, int maxTokens, float temperature, int topK, float topP, long seed,
                                   Consumer<String> sink) {
         List<Integer> ids = new ArrayList<>();
-        ids.add(CharTokenizer.EOS);
+        ids.add(tokenizer.eosId());
         for (int id : tokenizer.encode(prompt)) {
-            if (id != CharTokenizer.UNK) {
+            if (id != tokenizer.unkId()) { // unkId() is -1 for BPE, which can encode anything
                 ids.add(id);
             }
         }
 
         StringBuilder text = new StringBuilder(prompt);
         sink.accept(prompt);
+        Tokenizer.StreamDecoder decoder = tokenizer.newStreamDecoder();
         new TextGenerator(loaded.model(), new Sampler(seed)).generate(manager,
-                ids.stream().mapToInt(Integer::intValue).toArray(), maxTokens, CharTokenizer.EOS,
+                ids.stream().mapToInt(Integer::intValue).toArray(), maxTokens, tokenizer.eosId(),
                 temperature, topK, topP, 1.0f, window, id -> {
-                    String piece = tokenizer.decodeToken(id);
-                    text.append(piece);
-                    sink.accept(piece);
+                    String piece = decoder.accept(id);
+                    if (!piece.isEmpty()) {
+                        text.append(piece);
+                        sink.accept(piece);
+                    }
                 });
+        String rest = decoder.finish();
+        if (!rest.isEmpty()) {
+            text.append(rest);
+            sink.accept(rest);
+        }
         return text.toString();
     }
 
-    /** The characters of {@code text} that are not in the vocabulary. */
-    static String unknownCharacters(CharTokenizer tokenizer, String text) {
+    /** The characters of {@code text} the tokenizer cannot represent (always empty for byte-level BPE). */
+    static String unknownCharacters(Tokenizer tokenizer, String text) {
+        if (tokenizer.unkId() < 0) {
+            return "";
+        }
         StringBuilder unknown = new StringBuilder();
         for (char c : text.toCharArray()) {
-            if (tokenizer.encode(String.valueOf(c))[0] == CharTokenizer.UNK && unknown.indexOf(String.valueOf(c)) < 0) {
+            if (tokenizer.encode(String.valueOf(c))[0] == tokenizer.unkId() && unknown.indexOf(String.valueOf(c)) < 0) {
                 unknown.append(c);
             }
         }
